@@ -21,7 +21,11 @@ import org.skriptlang.skript.util.Registry;
 
 /**
  * Utility class for Skript addons. Use {@link Skript#registerAddon(JavaPlugin)} to create a SkriptAddon instance for your plugin.
+ * @deprecated Use {@link org.skriptlang.skript.addon.SkriptAddon} instead.
+ * Register using {@link org.skriptlang.skript.Skript#registerAddon(Class, String)}.
+ * Obtain a Skript instance with {@link Skript#instance()}.
  */
+@Deprecated(since = "2.14", forRemoval = true)
 public final class SkriptAddon implements org.skriptlang.skript.addon.SkriptAddon {
 
 	public final JavaPlugin plugin;
@@ -129,61 +133,51 @@ public final class SkriptAddon implements org.skriptlang.skript.addon.SkriptAddo
 	// Modern SkriptAddon Compatibility
 	//
 
-	@ApiStatus.Experimental
 	static SkriptAddon fromModern(org.skriptlang.skript.addon.SkriptAddon addon) {
 		return new SkriptAddon(JavaPlugin.getProvidingPlugin(addon.source()), addon);
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public Class<?> source() {
 		return addon.source();
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public String name() {
 		return addon.name();
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public <R extends Registry<?>> void storeRegistry(Class<R> registryClass, R registry) {
 		addon.storeRegistry(registryClass, registry);
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public void removeRegistry(Class<? extends Registry<?>> registryClass) {
 		addon.removeRegistry(registryClass);
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public boolean hasRegistry(Class<? extends Registry<?>> registryClass) {
 		return addon.hasRegistry(registryClass);
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public <R extends Registry<?>> R registry(Class<R> registryClass) {
 		return addon.registry(registryClass);
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public <R extends Registry<?>> R registry(Class<R> registryClass, Supplier<R> putIfAbsent) {
 		return addon.registry(registryClass, putIfAbsent);
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public SyntaxRegistry syntaxRegistry() {
 		return addon.syntaxRegistry();
 	}
 
 	@Override
-	@ApiStatus.Experimental
 	public Localizer localizer() {
 		return addon.localizer();
 	}
