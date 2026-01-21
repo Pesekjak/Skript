@@ -113,8 +113,10 @@ class SyntaxInfoImpl<T extends SyntaxElement> implements SyntaxInfo<T> {
 
 	@Override
 	public T instance() {
-		if (providedSupplier != null) return providedSupplier.get();
-		if (generatedSupplier != null) return generatedSupplier.get();
+		if (providedSupplier != null)
+			return providedSupplier.get();
+		if (generatedSupplier != null)
+			return generatedSupplier.get();
 		try {
 			generatedSupplier = instanceSupplier(type());
 		} catch (Throwable e) {
