@@ -10,6 +10,8 @@ import org.skriptlang.skript.docs.Origin;
 import org.skriptlang.skript.util.ClassUtils;
 import org.skriptlang.skript.util.Priority;
 
+import java.lang.invoke.*;
+import java.lang.reflect.Constructor;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -40,9 +42,30 @@ class SyntaxInfoImpl<T extends SyntaxElement> implements SyntaxInfo<T> {
 		return priority;
 	}
 
+	private static <T> Supplier<T> instanceSupplier(Class<T> type) throws Throwable {
+		Preconditions.checkState(ClassUtils.isNormalClass(type),
+			"Failed to register a syntax info for '" + type.getName() + "'."
+			+ " Element classes must be a normal type unless a supplier is provided.");
+		Constructor<T> nullaryConstructor = type.getDeclaredConstructor();
+		MethodHandles.Lookup lookup = MethodHandles.privateLookupIn(type, MethodHandles.lookup());
+		MethodHandle methodHandle = lookup.unreflectConstructor(nullaryConstructor);
+		CallSite callSite = LambdaMetafactory.metafactory(lookup,
+			"get",
+			MethodType.methodType(Supplier.class),
+			MethodType.methodType(Object.class),
+			methodHandle,
+			methodHandle.type()
+		);
+		//noinspection unchecked
+		return (Supplier<T>) callSite.getTarget().invokeExact();
+	}
+
 	private final Origin origin;
 	private final Class<T> type;
-	private final @Nullable Supplier<T> supplier;
+
+	private final @Nullable Supplier<T> providedSupplier;
+	private @Nullable Supplier<T> generatedSupplier;
+
 	private final SequencedCollection<String> patterns;
 	private final Priority priority;
 
@@ -58,7 +81,7 @@ class SyntaxInfoImpl<T extends SyntaxElement> implements SyntaxInfo<T> {
 				+ " There must be at least one pattern.");
 		this.origin = origin;
 		this.type = type;
-		this.supplier = supplier;
+		this.providedSupplier = supplier;
 		this.patterns = ImmutableList.copyOf(patterns);
 		if (priority == null) {
 			priority = estimatePriority(patterns);
@@ -70,8 +93,8 @@ class SyntaxInfoImpl<T extends SyntaxElement> implements SyntaxInfo<T> {
 	public Builder<? extends Builder<?, T>, T> toBuilder() {
 		var builder = new BuilderImpl<>(type);
 		builder.origin(origin);
-		if (supplier != null) {
-			builder.supplier(supplier);
+		if (providedSupplier != null) {
+			builder.supplier(providedSupplier);
 		}
 		builder.addPatterns(patterns);
 		builder.priority(priority);
@@ -90,11 +113,14 @@ class SyntaxInfoImpl<T extends SyntaxElement> implements SyntaxInfo<T> {
 
 	@Override
 	public T instance() {
+		if (providedSupplier != null) return providedSupplier.get();
+		if (generatedSupplier != null) return generatedSupplier.get();
 		try {
-			return supplier == null ? type.getDeclaredConstructor().newInstance() : supplier.get();
-		} catch (ReflectiveOperationException e) {
-			throw new RuntimeException(e);
+			generatedSupplier = instanceSupplier(type());
+		} catch (Throwable e) {
+			throw new RuntimeException("Failed to create supplier for " + type.getName() + ".", e);
 		}
+		return generatedSupplier.get();
 	}
 
 	@Override
