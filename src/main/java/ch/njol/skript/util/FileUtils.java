@@ -94,7 +94,7 @@ public abstract class FileUtils {
 
 		Path backup = backupFolder.resolve(newFileName);
 		if (Files.exists(backup))
-			throw new IOException("Backup file " + backup.getFileName() + " does already exist");
+			throw new IOException("Backup file " + backup.getFileName() + " already exists");
 
 		if (compress) {
 			try (OutputStream os = Files.newOutputStream(backup);
