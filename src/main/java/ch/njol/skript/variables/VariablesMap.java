@@ -127,7 +127,7 @@ public final class VariablesMap {
 
 	private final Node root = new Node();
 	private final LoadingCache<String, Optional<Object>> cache = CacheBuilder.newBuilder()
-		.maximumSize(10_000)
+		.maximumWeight(10_000)
 		.expireAfterAccess(10, TimeUnit.MINUTES)
 		.weigher((Weigher<String, Optional<Object>>) (key, value) -> {
 			if (value.isEmpty())
@@ -210,19 +210,15 @@ public final class VariablesMap {
 		}
 
 		if (isList) {
-			// map the radix node to a sorted map
 			long stamp = current.lock.readLock();
 			try {
 				if (!current.hasChildren()) return Optional.empty();
 				assert current.children != null;
 				Map<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
 				current.children.forEach((key, child) -> {
-					if (child.isEmpty()) return;
-					if (child.value != null && !child.hasChildren()) {
-						map.put(key, child.value);
-					} else {
-						map.put(key, asTreeMap(child));
-					}
+					if (child.isEmpty())
+						return;
+					map.put(key, resolve(child));
 				});
 				return map.isEmpty() ? Optional.empty() : Optional.of(map);
 			} finally {
@@ -244,12 +240,26 @@ public final class VariablesMap {
 		}
 	}
 
-	private TreeMap<String, Object> asTreeMap(Node node) {
+	/**
+	 * Converts the node into its object representation.
+	 * <p>
+	 * That is either a TreeMap or its value if it has no children.
+	 *
+	 * @param node node
+	 * @return node as object
+	 */
+	private Object resolve(Node node) {
+		if (node.value != null && !node.hasChildren())
+			return node.value;
 		TreeMap<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
-		if (node.value != null) map.put(null, node.value);
+		if (node.value != null)
+			map.put(null, node.value);
 		if (node.hasChildren()) {
 			assert node.children != null;
-			node.children.forEach((key, child) -> map.put(key, asTreeMap(child)));
+			node.children.forEach((key, child) -> {
+				if (!child.isEmpty())
+					map.put(key, resolve(child));
+			});
 		}
 		return map;
 	}
