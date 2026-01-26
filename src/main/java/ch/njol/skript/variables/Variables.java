@@ -162,8 +162,7 @@ public class Variables {
 	 * @return whether the loading was successful.
 	 */
 	public static boolean load() {
-		assert variables.treeMap.isEmpty();
-		assert variables.hashMap.isEmpty();
+		assert variables.isEmpty();
 		assert STORAGES.isEmpty();
 
 		Config config = SkriptConfig.getConfig();
@@ -340,17 +339,7 @@ public class Variables {
 	 * Remember to lock with {@link #getReadLock()} and to not make any changes!
 	 */
 	static TreeMap<String, Object> getVariables() {
-		return variables.treeMap;
-	}
-
-	/**
-	 * Gets the {@link Map} of all global variables.
-	 * <p>
-	 * This map cannot be modified.
-	 * Remember to lock with {@link #getReadLock()}!
-	 */
-	static Map<String, Object> getVariablesHashMap() {
-		return Collections.unmodifiableMap(variables.hashMap);
+		return new TreeMap<>(variables.getAll());
 	}
 
 	/**
@@ -783,7 +772,7 @@ public class Variables {
 						if (serializedValue == null) {
 							variablesStorage.save(name, null, null);
 						} else {
-							variablesStorage.save(name, serializedValue.type, serializedValue.data);
+							variablesStorage.save(name, serializedValue.type(), serializedValue.data());
 						}
 
 						// Remove from old storage
@@ -912,7 +901,7 @@ public class Variables {
 				SerializedVariable variable = saveQueue.take();
 
 				for (VariablesStorage variablesStorage : STORAGES) {
-					if (variablesStorage.accept(variable.name)) {
+					if (variablesStorage.accept(variable.name())) {
 						variablesStorage.save(variable);
 
 						break;
@@ -954,10 +943,10 @@ public class Variables {
 	 *
 	 * @return the amount of variables.
 	 */
-	public static int numVariables() {
+	public static long numVariables() {
 		try {
 			variablesLock.readLock().lock();
-			return variables.hashMap.size();
+			return variables.size();
 		} finally {
 			variablesLock.readLock().unlock();
 		}

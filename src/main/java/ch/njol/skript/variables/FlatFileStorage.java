@@ -489,7 +489,7 @@ public class FlatFileStorage extends VariablesStorage {
 
 								// Write the CSV line
 								if (serializedValue != null)
-									writeCSV(pw, name, serializedValue.type, encode(serializedValue.data));
+									writeCSV(pw, name, serializedValue.type(), encode(serializedValue.data()));
 							}
 
 							break;

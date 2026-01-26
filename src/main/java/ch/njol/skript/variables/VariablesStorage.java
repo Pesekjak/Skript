@@ -1,8 +1,8 @@
 package ch.njol.skript.variables;
 
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
-import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.Set;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -21,7 +21,6 @@ import ch.njol.skript.util.FileUtils;
 import ch.njol.skript.util.Task;
 import ch.njol.skript.util.Timespan;
 import ch.njol.skript.variables.SerializedVariable.Value;
-import ch.njol.util.Closeable;
 
 /**
  * A variable storage is holds the means and methods of storing variables.
@@ -29,10 +28,7 @@ import ch.njol.util.Closeable;
  * This is usually some sort of database, and could be as simply as a text file.
  *
  * @see FlatFileStorage
- * @see DatabaseStorage
  */
-// FIXME ! large databases (>25 MB) cause the server to be unresponsive instead of loading slowly
-@SuppressWarnings({"SuspiciousIndentAfterControlStatement", "removal"})
 public abstract class VariablesStorage implements Closeable {
 
 	/**
@@ -99,13 +95,13 @@ public abstract class VariablesStorage implements Closeable {
 				try {
 					// Take a variable from the queue and process it
 					SerializedVariable variable = changesQueue.take();
-					Value value = variable.value;
+					Value value = variable.value();
 
 					// Actually save the variable
 					if (value != null)
-						save(variable.name, value.type, value.data);
+						save(variable.name(), value.type(), value.data());
 					else
-						save(variable.name, null, null);
+						save(variable.name(), null, null);
 				} catch (InterruptedException ignored) {
 					// Ignored as the `closed` field will indicate whether the thread actually needs to stop
 				}
@@ -273,7 +269,8 @@ public abstract class VariablesStorage implements Closeable {
 			return false;
 
 		writeThread.start();
-		Skript.closeOnDisable(this);
+		//noinspection removal
+		Skript.closeOnDisable(this::close);
 
 		return true;
 	}
@@ -387,7 +384,6 @@ public abstract class VariablesStorage implements Closeable {
 	boolean accept(@Nullable String var) {
 		if (var == null)
 			return false;
-
 		return variableNamePattern == null || variableNamePattern.matcher(var).matches();
 	}
 
@@ -413,11 +409,11 @@ public abstract class VariablesStorage implements Closeable {
 	/**
 	 * The last time a warning was printed for many variables in the queue.
 	 */
-	private long lastWarning = Long.MIN_VALUE;
+	private long lastWarning = -1;
 	/**
 	 * The last time an error was printed for too many variables in the queue.
 	 */
-	private long lastError = Long.MIN_VALUE;
+	private long lastError = -1;
 
 	/**
 	 * Saves the given serialized variable.
@@ -471,7 +467,7 @@ public abstract class VariablesStorage implements Closeable {
 	@Override
 	public void close() {
 		// Wait for all variable changes to be processed
-		while (changesQueue.size() > 0) {
+		while (!changesQueue.isEmpty()) {
 			try {
 				Thread.sleep(10);
 			} catch (InterruptedException ignored) {}
@@ -507,6 +503,6 @@ public abstract class VariablesStorage implements Closeable {
 	 * @param value the serialized value of the variable.
 	 * @return Whether the variable was saved.
 	 */
-	protected abstract boolean save(String name, @Nullable String type, @Nullable byte[] value);
+	protected abstract boolean save(String name, @Nullable String type, byte @Nullable [] value);
 
 }
