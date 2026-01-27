@@ -12,6 +12,10 @@ import org.jetbrains.annotations.Nullable;
  */
 public record SerializedVariable(String name, @Nullable Value value) {
 
+	public SerializedVariable(String name, String type, byte[] data) {
+		this(name, new Value(type, data));
+	}
+
 	/**
 	 * A serialized value of a variable.
 	 *

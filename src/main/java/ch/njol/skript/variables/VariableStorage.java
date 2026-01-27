@@ -1,6 +1,5 @@
 package ch.njol.skript.variables;
 
-import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
 import java.util.HashSet;
@@ -10,8 +9,8 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 import org.jetbrains.annotations.Nullable;
-
 import ch.njol.skript.Skript;
+import ch.njol.skript.SkriptAddon;
 import ch.njol.skript.config.SectionNode;
 import ch.njol.skript.lang.ParseContext;
 import ch.njol.skript.log.ParseLogHandler;
@@ -20,7 +19,9 @@ import ch.njol.skript.registrations.Classes;
 import ch.njol.skript.util.FileUtils;
 import ch.njol.skript.util.Task;
 import ch.njol.skript.util.Timespan;
+import ch.njol.skript.util.Timespan.TimePeriod;
 import ch.njol.skript.variables.SerializedVariable.Value;
+import ch.njol.util.Closeable;
 
 /**
  * A variable storage is holds the means and methods of storing variables.
@@ -28,8 +29,11 @@ import ch.njol.skript.variables.SerializedVariable.Value;
  * This is usually some sort of database, and could be as simply as a text file.
  *
  * @see FlatFileStorage
+ * @see DatabaseStorage
  */
-public abstract class VariablesStorage implements Closeable {
+// FIXME ! large databases (>25 MB) cause the server to be unresponsive instead of loading slowly
+@SuppressWarnings({"SuspiciousIndentAfterControlStatement", "removal"})
+public abstract class VariableStorage implements Closeable {
 
 	/**
 	 * The size of the variable changes queue.
@@ -77,18 +81,21 @@ public abstract class VariablesStorage implements Closeable {
 	 */
 	// created in the constructor, started in load()
 	private final Thread writeThread;
+	private final SkriptAddon source;
 
 	/**
 	 * Creates a new variable storage with the given name.
 	 * <p>
 	 * This will also create the {@link #writeThread}, but it must be started
-	 * with {@link #load(SectionNode)}.
+	 * with {@link #loadConfig(SectionNode)}.
 	 *
+	 * @param source the SkriptAddon instance that registered this VariableStorage.
 	 * @param type the database type i.e. CSV.
 	 */
-	protected VariablesStorage(String type) {
+	protected VariableStorage(SkriptAddon source, String type) {
 		assert type != null;
-		databaseType = type;
+		this.databaseType = type;
+		this.source = source;
 
 		writeThread = Skript.newThread(() -> {
 			while (!closed) {
@@ -125,10 +132,18 @@ public abstract class VariablesStorage implements Closeable {
 
 	/**
 	 * Get the config type of a database
-	 * @return type of databse
+	 * 
+	 * @return type of database
 	 */
 	protected final String getDatabaseType() {
 		return databaseType;
+	}
+
+	/**
+	 * @return The SkriptAddon instance that registered this VariableStorage.
+	 */
+	public final SkriptAddon getRegisterSource() {
+		return source;
 	}
 
 	/**
@@ -140,7 +155,7 @@ public abstract class VariablesStorage implements Closeable {
 	 * or not found.
 	 */
 	@Nullable
-	protected String getValue(SectionNode sectionNode, String key) {
+	protected final String getValue(SectionNode sectionNode, String key) {
 		return getValue(sectionNode, key, String.class);
 	}
 
@@ -156,18 +171,51 @@ public abstract class VariablesStorage implements Closeable {
 	 * @param <T> the type.
 	 */
 	@Nullable
-	protected <T> T getValue(SectionNode sectionNode, String key, Class<T> type) {
+	protected final <T> T getValue(SectionNode sectionNode, String key, Class<T> type) {
+		return getValue(sectionNode, key, type, true);
+	}
+
+	/**
+	 * Gets the value at the given key of the given section node,
+	 * parsed with the given type. Prints no errors, but can return null.
+	 *
+	 * @param sectionNode the section node.
+	 * @param key the key.
+	 * @param type the type.
+	 * @return the parsed value, or {@code null} if the value was invalid,
+	 * or not found.
+	 * @param <T> the type.
+	 */
+	@Nullable
+	protected final <T> T getOptional(SectionNode sectionNode, String key, Class<T> type) {
+		return getValue(sectionNode, key, type, false);
+	}
+
+	/**
+	 * Gets the value at the given key of the given section node,
+	 * parsed with the given type.
+	 *
+	 * @param sectionNode the section node.
+	 * @param key the key.
+	 * @param type the type.
+	 * @param error if Skript should print errors and stop loading.
+	 * @return the parsed value, or {@code null} if the value was invalid,
+	 * or not found.
+	 * @param <T> the type.
+	 */
+	@Nullable
+	private <T> T getValue(SectionNode sectionNode, String key, Class<T> type, boolean error) {
 		String rawValue = sectionNode.getValue(key);
-		// Section node doesn't have this key
 		if (rawValue == null) {
-			Skript.error("The config is missing the entry for '" + key + "' in the database '" + databaseName + "'");
+			if (error)
+				Skript.error("The config is missing the entry for '" + key + "' in the database '" + databaseName + "'");
 			return null;
 		}
 
 		try (ParseLogHandler log = SkriptLogger.startParseLogHandler()) {
 			T parsedValue = Classes.parse(rawValue, type, ParseContext.CONFIG);
 
-			if (parsedValue == null)
+			if (parsedValue == null && error)
 				// Parsing failed
 				log.printError("The entry for '" + key + "' in the database '" + databaseName + "' must be " +
 					Classes.getSuperClassInfo(type).getName().withIndefiniteArticle());
@@ -182,14 +230,14 @@ public abstract class VariablesStorage implements Closeable {
 
 	/**
 	 * Loads the configuration for this variable storage
-	 * from the given section node.
+	 * from the given section node. Loads internal required values first in loadConfig.
+	 * {@link #load(SectionNode)} is for extending classes.
 	 *
 	 * @param sectionNode the section node.
 	 * @return whether the loading succeeded.
 	 */
-	public final boolean load(SectionNode sectionNode) {
+	public final boolean loadConfig(SectionNode sectionNode) {
 		databaseName = sectionNode.getKey();
-
 		String pattern = getValue(sectionNode, "pattern");
 		if (pattern == null)
 			return false;
@@ -265,14 +313,23 @@ public abstract class VariablesStorage implements Closeable {
 		}
 
 		// Load the entries custom to the variable storage
-		if (!load_i(sectionNode))
+		if (!loadAbstract(sectionNode))
 			return false;
 
 		writeThread.start();
-		//noinspection removal
-		Skript.closeOnDisable(this::close);
-
+		Skript.closeOnDisable(this);
 		return true;
+	}
+
+	/**
+	 * Used for abstract extending classes intercepting the
+	 * configuration before sending to the final implementation class.
+	 * 
+	 * Override to use this method in AnotherAbstractClass;
+	 * VariablesStorage -> AnotherAbstractClass -> FinalImplementation
+	 */
+	protected boolean loadAbstract(SectionNode sectionNode) {
+		return load(sectionNode);
 	}
 
 	/**
@@ -281,7 +338,7 @@ public abstract class VariablesStorage implements Closeable {
 	 * @return Whether the database could be loaded successfully,
 	 * i.e. whether the config is correct and all variables could be loaded.
 	 */
-	protected abstract boolean load_i(SectionNode n);
+	protected abstract boolean load(SectionNode n);
 
 	/**
 	 * Called after all storages have been loaded, and variables
@@ -318,7 +375,7 @@ public abstract class VariablesStorage implements Closeable {
 	/**
 	 * (Re)connects to the database.
 	 * <p>
-	 * Not called on the first connect: do this in {@link #load_i(SectionNode)}.
+	 * Not called on the first connect: do this in {@link #load(SectionNode)}.
 	 * An error should be printed by this method
 	 * prior to returning {@code false}.
 	 *
@@ -344,9 +401,10 @@ public abstract class VariablesStorage implements Closeable {
 	 */
 	public void startBackupTask(Timespan backupInterval, boolean removeBackups, int toKeep) {
 		// File is null or backup interval is invalid
-		if (file == null || backupInterval.getAs(Timespan.TimePeriod.TICK) == 0)
+		var backupIntervalTicks = backupInterval.getAs(TimePeriod.TICK);
+		if (file == null || backupIntervalTicks <= 0)
 			return;
-		backupTask = new Task(Skript.getInstance(), backupInterval.getAs(Timespan.TimePeriod.TICK), backupInterval.getAs(Timespan.TimePeriod.TICK), true) {
+		backupTask = new Task(Skript.getInstance(), backupIntervalTicks, backupIntervalTicks, true) {
 			@Override
 			public void run() {
 				synchronized (connectionLock) {
@@ -384,6 +442,7 @@ public abstract class VariablesStorage implements Closeable {
 	boolean accept(@Nullable String var) {
 		if (var == null)
 			return false;
+
 		return variableNamePattern == null || variableNamePattern.matcher(var).matches();
 	}
 
@@ -409,11 +468,11 @@ public abstract class VariablesStorage implements Closeable {
 	/**
 	 * The last time a warning was printed for many variables in the queue.
 	 */
-	private long lastWarning = -1;
+	private long lastWarning = Long.MIN_VALUE;
 	/**
 	 * The last time an error was printed for too many variables in the queue.
 	 */
-	private long lastError = -1;
+	private long lastError = Long.MIN_VALUE;
 
 	/**
 	 * Saves the given serialized variable.
@@ -467,7 +526,7 @@ public abstract class VariablesStorage implements Closeable {
 	@Override
 	public void close() {
 		// Wait for all variable changes to be processed
-		while (!changesQueue.isEmpty()) {
+		while (changesQueue.size() > 0) {
 			try {
 				Thread.sleep(10);
 			} catch (InterruptedException ignored) {}
@@ -484,7 +543,7 @@ public abstract class VariablesStorage implements Closeable {
 	 * Only used if all variables are saved immediately
 	 * after calling this method.
 	 */
-	protected void clearChangesQueue() {
+	protected final void clearChangesQueue() {
 		changesQueue.clear();
 	}
 
@@ -503,6 +562,6 @@ public abstract class VariablesStorage implements Closeable {
 	 * @param value the serialized value of the variable.
 	 * @return Whether the variable was saved.
 	 */
-	protected abstract boolean save(String name, @Nullable String type, byte @Nullable [] value);
+	protected abstract boolean save(String name, @Nullable String type, @Nullable byte[] value);
 
 }
