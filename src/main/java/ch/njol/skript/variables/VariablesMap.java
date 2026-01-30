@@ -22,7 +22,10 @@ import java.util.function.BiConsumer;
 @ThreadSafe
 public final class VariablesMap {
 
-	private static final Comparator<String> VARIABLE_NAME_COMP = (s1, s2) -> {
+	/**
+	 * Comparator for variable names.
+	 */
+	public static final Comparator<String> VARIABLE_NAME_COMP = (s1, s2) -> {
 		if (s1 == null)
 			return s2 == null ? 0 : -1;
 		if (s2 == null)
@@ -125,7 +128,17 @@ public final class VariablesMap {
 		return 0;
 	};
 
+	/**
+	 * Root node of the tree.
+	 */
 	private final Node root = new Node();
+
+	/**
+	 * Cache for recently computed variable values (for both single and lists).
+	 * <p>
+	 * They are wrapped in optional to allow cache of null values as cache does not
+	 * allow null values. This is needed for variables as they may be empty.
+	 */
 	private final LoadingCache<String, Optional<Object>> cache = CacheBuilder.newBuilder()
 		.maximumWeight(10_000)
 		.expireAfterAccess(10, TimeUnit.MINUTES)
@@ -156,7 +169,7 @@ public final class VariablesMap {
 	}
 
 	/**
-	 * Returns the internal value of the requested variable.
+	 * Returns the value of the requested variable.
 	 * <p>
 	 * In case of list variables, the returned map is not the backing map
 	 * of the variables map and can be edited safely (is modifiable).
@@ -186,6 +199,13 @@ public final class VariablesMap {
 		return cache.getUnchecked(name).orElse(null);
 	}
 
+	/**
+	 * Implementation of the getVariable that wraps the value in optional
+	 * to allow its caching.
+	 *
+	 * @param name name of the variable
+	 * @return variable value or empty optional if none is set, for returned format see {@link #getVariable(String)}.
+	 */
 	public Optional<Object> getVariableOpt(String name) {
 		boolean isList = name.endsWith(Variable.SEPARATOR + "*");
 		if (isList)
@@ -209,10 +229,12 @@ public final class VariablesMap {
 			}
 		}
 
+		// reading list, we must create a map representation
 		if (isList) {
 			long stamp = current.lock.readLock();
 			try {
-				if (!current.hasChildren()) return Optional.empty();
+				if (!current.hasChildren())
+					return Optional.empty();
 				assert current.children != null;
 				Map<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
 				current.children.forEach((key, child) -> {
@@ -224,26 +246,28 @@ public final class VariablesMap {
 			} finally {
 				current.lock.unlockRead(stamp);
 			}
-		} else {
-			// read the value, first try optimistic, if fails acquire the lock
-			long stamp = current.lock.tryOptimisticRead();
-			Object val = current.value;
-			if (!current.lock.validate(stamp)) {
-				stamp = current.lock.readLock();
-				try {
-					val = current.value;
-				} finally {
-					current.lock.unlockRead(stamp);
-				}
-			}
-			return Optional.ofNullable(val);
 		}
+
+		// read single value, first try optimistic, if fails to acquire the lock
+		long stamp = current.lock.tryOptimisticRead();
+		Object val = current.value;
+		if (!current.lock.validate(stamp)) {
+			stamp = current.lock.readLock();
+			try {
+				val = current.value;
+			} finally {
+				current.lock.unlockRead(stamp);
+			}
+		}
+		return Optional.ofNullable(val);
 	}
 
 	/**
 	 * Converts the node into its object representation.
 	 * <p>
 	 * That is either a TreeMap or its value if it has no children.
+	 * <p>
+	 * Called must have the read lock of the node.
 	 *
 	 * @param node node
 	 * @return node as object
@@ -287,7 +311,11 @@ public final class VariablesMap {
 		String[] parts = Variables.splitVariableName(actualName);
 
 		// set variable before updating the cache
-		setVariable(root, parts, 0, value, isList);
+		if (value == null) {
+			clearVariable(root, parts, 0, isList);
+		} else {
+			setSingleVariable(root, parts, value);
+		}
 
 		// invalidate the exact key
 		cache.invalidate(name);
@@ -295,7 +323,7 @@ public final class VariablesMap {
 		// invalidate all parents
 		if (!isList) {
 			StringBuilder buffer = new StringBuilder();
-			for (int i = 0; i < parts.length - 1 /* -1 because the exact key is invalidated before */; i++) {
+			for (int i = 0; i < parts.length - 1 /* -1 because we invalidate parents */; i++) {
 				if (i > 0)
 					buffer.append(Variable.SEPARATOR);
 				buffer.append(parts[i]);
@@ -310,7 +338,78 @@ public final class VariablesMap {
 		}
 	}
 
-	private boolean setVariable(Node current, String[] parts, int index, @Nullable Object value, boolean isListClear) {
+	/**
+	 * Optimized iterative setter for single non-null values.
+	 * <p>
+	 * Traversals use read locks, write lock is only acquired at the specific node
+	 * that needs modification.
+	 * <p>
+	 * This is possible because prune does not happen when setting non-null values (the
+	 * parent nodes are not modified on the way back)
+	 */
+	private void setSingleVariable(Node root, String[] parts, Object value) {
+		Node current = root;
+		long stamp = current.lock.readLock();
+		try {
+			for (int i = 0; i < parts.length; i++) {
+				String key = parts[i];
+				boolean isLast = i == parts.length - 1;
+
+				// we need write lock if the child does not exist (to create the node in the map)
+				boolean childExists = current.children != null && current.children.containsKey(key);
+
+				if (!childExists) {
+					// try to upgrade
+					long ws = current.lock.tryConvertToWriteLock(stamp);
+					if (ws == 0L) {
+						// if failed, reverse and wait for write lock
+						current.lock.unlockRead(stamp);
+						stamp = current.lock.writeLock();
+					} else {
+						stamp = ws;
+					}
+					if (current.children == null)
+						current.children = new TreeMap<>(VARIABLE_NAME_COMP);
+					// could already be added during the waiting on the write lock
+					current.children.putIfAbsent(key, new Node());
+				}
+
+				assert current.children != null;
+				Node next = current.children.get(key);
+				// for last node we write the value
+				long nextStamp = isLast ? next.lock.writeLock() : next.lock.readLock();
+
+				if (StampedLock.isWriteLockStamp(stamp)) {
+					current.lock.unlockWrite(stamp);
+				} else {
+					current.lock.unlockRead(stamp);
+				}
+
+				current = next;
+				stamp = nextStamp;
+
+				if (isLast) {
+					current.value = value; // we have write lock
+					return;
+				}
+			}
+		} finally {
+			// unlock the final node
+			if (StampedLock.isWriteLockStamp(stamp)) {
+				current.lock.unlockWrite(stamp);
+			} else {
+				current.lock.unlockRead(stamp);
+			}
+		}
+	}
+
+	/**
+	 * Recursive setter for clearing values.
+	 * <p>
+	 * This write locks the whole path in the radix tree because on the exit
+	 * it is required to delete empty nodes.
+	 */
+	private boolean clearVariable(Node current, String[] parts, int index, boolean isListClear) {
 		long stamp = current.lock.writeLock();
 		try {
 			// reached target node
@@ -318,27 +417,20 @@ public final class VariablesMap {
 				if (isListClear) {
 					current.children = null; // clear the children
 				} else {
-					current.value = value;
+					current.value = null;
 				}
 				return current.isEmpty();
 			}
 
-			if (current.children == null) {
-				if (value == null)
-					return current.isEmpty();
-				current.children = new TreeMap<>(VARIABLE_NAME_COMP);
-			}
+			if (current.children == null)
+				return current.isEmpty();
 
 			String key = parts[index];
 			Node child = current.children.get(key);
-			if (child == null) {
-				if (value == null)
-					return current.isEmpty();
-				child = new Node();
-				current.children.put(key, child);
-			}
+			if (child == null)
+				return current.isEmpty();
 
-			boolean prune = setVariable(child, parts, index + 1, value, isListClear);
+			boolean prune = clearVariable(child, parts, index + 1, isListClear);
 
 			// do not store empty nodes that lead to nothing
 			if (prune) {
@@ -356,7 +448,7 @@ public final class VariablesMap {
 	/**
 	 * Creates a copy of this map.
 	 * <p>
-	 * This method is strongly consistent and returns a copy of a snapshot of the variables map at
+	 * This method returns a copy of a snapshot of the variables map at
 	 * the current moment.
 	 *
 	 * @return the copy.
@@ -397,7 +489,7 @@ public final class VariablesMap {
 	 * <p>
 	 * The map is no guaranteed order and may not be modifiable.
 	 * <p>
-	 * This method is strongly consistent and returns a full snapshot of the variables map at
+	 * This method returns a full snapshot of the variables map at
 	 * the current moment.
 	 * <p>
 	 * This map is not nested and contains variables in format {@code full key <-> value}
@@ -430,7 +522,7 @@ public final class VariablesMap {
 	/**
 	 * Returns number of variables in this map.
 	 * <p>
-	 * This method is strongly consistent and returns number of variables at
+	 * This method returns number of variables at
 	 * the current moment.
 	 *
 	 * @return number of variables in this map
