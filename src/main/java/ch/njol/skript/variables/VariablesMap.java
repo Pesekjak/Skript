@@ -8,6 +8,8 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.*;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.BiConsumer;
 
@@ -124,11 +126,6 @@ public final class VariablesMap {
 	};
 
 	/**
-	 * Root node of the tree.
-	 */
-	private final Node root = new Node();
-
-	/**
 	 * A node in the radix tree.
 	 */
 	private static class Node {
@@ -136,13 +133,89 @@ public final class VariablesMap {
 		@Nullable Object value;
 		@Nullable Map<String, Node> children;
 
+		/**
+		 * @return whether the node has children
+		 */
 		boolean hasChildren() {
 			return children != null && !children.isEmpty();
 		}
 
+		/**
+		 * @return whether the node is empty (has no value and no children)
+		 */
 		boolean isEmpty() {
 			return value == null && !hasChildren();
 		}
+
+		/**
+		 * Unlocks the lock with given stamp.
+		 * <p>
+		 * Works for both read and write locks.
+		 *
+		 * @param stamp lock stamp
+		 */
+		void unlock(long stamp) {
+			if (StampedLock.isWriteLockStamp(stamp)) {
+				lock.unlockWrite(stamp);
+			} else {
+				lock.unlockRead(stamp);
+			}
+		}
+	}
+
+	/**
+	 * Root node of the tree.
+	 */
+	private final Node root = new Node();
+
+	/**
+	 * Estimate of empty branches in the radix tree.
+	 * <p>
+	 * The real number may be different as some branches may be populated after clear.
+	 */
+	private final AtomicInteger leftEmpty = new AtomicInteger(0);
+
+	/**
+	 * At how many writes that leave empty branches {@link #prune()} should be executed.
+	 */
+	private final int pruneAt;
+
+	/**
+	 * Executor of automatic prune operation.
+	 */
+	private final Executor pruneExecutor;
+
+	/**
+	 * Constructs new variables map that automatically calls {@link #prune()}
+	 * after certain number of {@link #setVariable(String, Object)} left
+	 * empty branches in the radix tree.
+	 *
+	 * @param pruneAt after which number of such writes the variables map should call prune
+	 * @param pruneExecutor executor which will execute the expensive prune operation
+	 */
+	public VariablesMap(int pruneAt, Executor pruneExecutor) {
+		this.pruneAt = pruneAt;
+		this.pruneExecutor = pruneExecutor;
+	}
+
+	/**
+	 * Constructs new variables map that automatically calls {@link #prune()}
+	 * after certain number of {@link #setVariable(String, Object)} left
+	 * empty branches in the radix tree.
+	 *
+	 * @param pruneAt after which number of such writes the variables map should call prune
+	 */
+	public VariablesMap(int pruneAt) {
+		this(pruneAt, Runnable::run);
+	}
+
+	/**
+	 * Constructs new variables map.
+	 *
+	 * @see #prune()
+	 */
+	public VariablesMap() {
+		this(Integer.MAX_VALUE, Runnable::run);
 	}
 
 	/**
@@ -198,7 +271,8 @@ public final class VariablesMap {
 			}
 
 			if (isList) {
-				if (!current.hasChildren()) return null;
+				if (!current.hasChildren())
+					return null;
 				assert current.children != null;
 				Map<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
 				current.children.forEach((key, child) -> {
@@ -229,7 +303,7 @@ public final class VariablesMap {
 		try {
 			if (node.isEmpty())
 				return null;
-			if (node.value != null && !node.hasChildren())
+			if (!node.hasChildren())
 				return node.value;
 			TreeMap<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
 			if (node.value != null)
@@ -237,11 +311,12 @@ public final class VariablesMap {
 			if (node.hasChildren()) {
 				assert node.children != null;
 				node.children.forEach((key, child) -> {
-					if (!child.isEmpty())
-						map.put(key, resolve(child));
+					Object resolved = resolve(child);
+					if (resolved != null)
+						map.put(key, resolved);
 				});
 			}
-			return map;
+			return map.isEmpty() ? null : map;
 		} finally {
 			node.lock.unlockRead(stamp);
 		}
@@ -270,7 +345,7 @@ public final class VariablesMap {
 		String[] parts = Variables.splitVariableName(actualName);
 
 		if (value == null) {
-			clearVariable(root, parts, 0, isList);
+			clearVariable(root, parts, isList);
 		} else {
 			setSingleVariable(root, parts, value);
 		}
@@ -317,11 +392,7 @@ public final class VariablesMap {
 				// for last node we write the value
 				long nextStamp = isLast ? next.lock.writeLock() : next.lock.readLock();
 
-				if (StampedLock.isWriteLockStamp(stamp)) {
-					current.lock.unlockWrite(stamp);
-				} else {
-					current.lock.unlockRead(stamp);
-				}
+				current.unlock(stamp);
 
 				current = next;
 				stamp = nextStamp;
@@ -333,53 +404,91 @@ public final class VariablesMap {
 			}
 		} finally {
 			// unlock the final node
-			if (StampedLock.isWriteLockStamp(stamp)) {
-				current.lock.unlockWrite(stamp);
-			} else {
-				current.lock.unlockRead(stamp);
-			}
+			current.unlock(stamp);
 		}
 	}
 
 	/**
-	 * Recursive setter for clearing values.
-	 * <p>
-	 * This write locks the whole path in the radix tree because on the exit
-	 * it is required to delete empty nodes.
+	 * Iterative setter for clearing values.
 	 */
-	private boolean clearVariable(Node current, String[] parts, int index, boolean isListClear) {
-		long stamp = current.lock.writeLock();
+	private void clearVariable(Node root, String[] parts, boolean isListClear) {
+		Node current = root;
+		long stamp = current.lock.readLock();
+		boolean prune = false;
 		try {
-			// reached target node
-			if (index == parts.length) {
-				if (isListClear) {
-					current.children = null; // clear the children
-				} else {
-					current.value = null;
+			for (int i = 0; i < parts.length; i++) {
+				String key = parts[i];
+				boolean isLast = i == parts.length - 1;
+
+				// if child does not exist there is nothing to clear
+				if (current.children == null || !current.children.containsKey(key))
+					return; // unlocks in the finally block
+
+				Node next = current.children.get(key);
+				// for last node we write the value
+				long nextStamp = isLast ? next.lock.writeLock() : next.lock.readLock();
+
+				current.unlock(stamp);
+
+				current = next;
+				stamp = nextStamp;
+
+				if (isLast) {
+					if (isListClear) {
+						current.children = null;
+					} else {
+						current.value = null;
+					}
+
+					// clear may caused empty branches in the tree
+					if (current.isEmpty()) {
+						int count = leftEmpty.incrementAndGet();
+						// automatic prune call
+						if (count >= pruneAt) {
+							if (leftEmpty.compareAndSet(count, 0))
+								prune = true;
+						}
+					}
+					return;
 				}
-				return current.isEmpty();
 			}
-
-			if (current.children == null)
-				return current.isEmpty();
-
-			String key = parts[index];
-			Node child = current.children.get(key);
-			if (child == null)
-				return current.isEmpty();
-
-			boolean prune = clearVariable(child, parts, index + 1, isListClear);
-
-			// do not store empty nodes that lead to nothing
-			if (prune) {
-				current.children.remove(key);
-				if (current.children.isEmpty())
-					current.children = null;
-			}
-
-			return current.isEmpty();
 		} finally {
-			current.lock.unlockWrite(stamp);
+			current.unlock(stamp);
+			if (prune)
+				pruneExecutor.execute(this::prune);
+		}
+	}
+
+	/**
+	 * Prunes the entire tree, removing all empty nodes.
+	 * <p>
+	 * This operation is expensive and fully write locks the radix tree.
+	 */
+	public void prune() {
+		prune(root);
+	}
+
+	private boolean prune(Node node) {
+		long stamp = node.lock.writeLock();
+		try {
+			if (node.isEmpty())
+				return true;
+
+			assert node.children != null;
+			var it = node.children.entrySet().iterator();
+			while (it.hasNext()) {
+				var entry = it.next();
+				boolean isChildEmpty = prune(entry.getValue());
+				if (isChildEmpty)
+					it.remove();
+			}
+
+			if (node.children.isEmpty())
+				node.children = null;
+
+			return node.isEmpty();
+		} finally {
+			node.lock.unlockWrite(stamp);
 		}
 	}
 
