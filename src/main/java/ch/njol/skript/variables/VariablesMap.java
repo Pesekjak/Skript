@@ -3,16 +3,11 @@ package ch.njol.skript.variables;
 import ch.njol.skript.lang.Variable;
 import ch.njol.util.StringUtils;
 import com.google.common.base.Preconditions;
-import com.google.common.cache.CacheBuilder;
-import com.google.common.cache.CacheLoader;
-import com.google.common.cache.LoadingCache;
-import com.google.common.cache.Weigher;
 import com.google.errorprone.annotations.ThreadSafe;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.*;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.BiConsumer;
 
@@ -134,30 +129,12 @@ public final class VariablesMap {
 	private final Node root = new Node();
 
 	/**
-	 * Cache for recently computed variable values (for both single and lists).
-	 * <p>
-	 * They are wrapped in optional to allow cache of null values as cache does not
-	 * allow null values. This is needed for variables as they may be empty.
-	 */
-	private final LoadingCache<String, Optional<Object>> cache = CacheBuilder.newBuilder()
-		.maximumWeight(10_000)
-		.expireAfterAccess(10, TimeUnit.MINUTES)
-		.weigher((Weigher<String, Optional<Object>>) (key, value) -> {
-			if (value.isEmpty())
-				return 0;
-			if (value.get() instanceof Map<?,?> map)
-				return map.size();
-			return 1;
-		})
-		.build(CacheLoader.from(this::getVariableOpt));
-
-	/**
 	 * A node in the radix tree.
 	 */
 	private static class Node {
 		final StampedLock lock = new StampedLock();
 		@Nullable Object value;
-		@Nullable TreeMap<String, Node> children;
+		@Nullable Map<String, Node> children;
 
 		boolean hasChildren() {
 			return children != null && !children.isEmpty();
@@ -196,96 +173,78 @@ public final class VariablesMap {
 	 * or {@code null} if the variable is not set.
 	 */
 	public @Nullable Object getVariable(String name) {
-		return cache.getUnchecked(name).orElse(null);
-	}
-
-	/**
-	 * Implementation of the getVariable that wraps the value in optional
-	 * to allow its caching.
-	 *
-	 * @param name name of the variable
-	 * @return variable value or empty optional if none is set, for returned format see {@link #getVariable(String)}.
-	 */
-	public Optional<Object> getVariableOpt(String name) {
 		boolean isList = name.endsWith(Variable.SEPARATOR + "*");
 		if (isList)
 			name = name.substring(0, name.length() - (Variable.SEPARATOR.length() + 1)); // strip the "::*" suffix
 
 		String[] parts = Variables.splitVariableName(name);
 		Node current = root;
+		long stamp = current.lock.readLock();
 
-		// iterate through the variable parts
-		for (String part : parts) {
-			Node lockedNode = current;
-			long stamp = lockedNode.lock.readLock();
-			try {
-				if (!lockedNode.hasChildren()) return Optional.empty();
-				assert lockedNode.children != null;
-				Node next = lockedNode.children.get(part);
-				if (next == null) return Optional.empty();
-				current = next;
-			} finally {
-				lockedNode.lock.unlockRead(stamp);
-			}
-		}
-
-		// reading list, we must create a map representation
-		if (isList) {
-			long stamp = current.lock.readLock();
-			try {
+		try {
+			for (String part : parts) {
 				if (!current.hasChildren())
-					return Optional.empty();
+					return null;
+				assert current.children != null;
+				Node next = current.children.get(part);
+				if (next == null)
+					return null;
+
+				long nextStamp = next.lock.readLock();
+				current.lock.unlockRead(stamp);
+
+				current = next;
+				stamp = nextStamp;
+			}
+
+			if (isList) {
+				if (!current.hasChildren()) return null;
 				assert current.children != null;
 				Map<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
 				current.children.forEach((key, child) -> {
-					if (child.isEmpty())
-						return;
-					map.put(key, resolve(child));
+					Object resolved = resolve(child);
+					if (resolved != null)
+						map.put(key, resolved);
 				});
-				return map.isEmpty() ? Optional.empty() : Optional.of(map);
-			} finally {
-				current.lock.unlockRead(stamp);
-			}
-		}
 
-		// read single value, first try optimistic, if fails to acquire the lock
-		long stamp = current.lock.tryOptimisticRead();
-		Object val = current.value;
-		if (!current.lock.validate(stamp)) {
-			stamp = current.lock.readLock();
-			try {
-				val = current.value;
-			} finally {
-				current.lock.unlockRead(stamp);
+				return map.isEmpty() ? null : map;
+			} else {
+				return current.value;
 			}
+		} finally {
+			current.lock.unlockRead(stamp);
 		}
-		return Optional.ofNullable(val);
 	}
 
 	/**
 	 * Converts the node into its object representation.
 	 * <p>
 	 * That is either a TreeMap or its value if it has no children.
-	 * <p>
-	 * Called must have the read lock of the node.
 	 *
 	 * @param node node
 	 * @return node as object
 	 */
 	private Object resolve(Node node) {
-		if (node.value != null && !node.hasChildren())
-			return node.value;
-		TreeMap<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
-		if (node.value != null)
-			map.put(null, node.value);
-		if (node.hasChildren()) {
-			assert node.children != null;
-			node.children.forEach((key, child) -> {
-				if (!child.isEmpty())
-					map.put(key, resolve(child));
-			});
+		long stamp = node.lock.readLock();
+		try {
+			if (node.isEmpty())
+				return null;
+			if (node.value != null && !node.hasChildren())
+				return node.value;
+			TreeMap<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
+			if (node.value != null)
+				map.put(null, node.value);
+			if (node.hasChildren()) {
+				assert node.children != null;
+				node.children.forEach((key, child) -> {
+					if (!child.isEmpty())
+						map.put(key, resolve(child));
+				});
+			}
+			return map;
+		} finally {
+			node.lock.unlockRead(stamp);
 		}
-		return map;
 	}
 
 	/**
@@ -310,31 +269,10 @@ public final class VariablesMap {
 
 		String[] parts = Variables.splitVariableName(actualName);
 
-		// set variable before updating the cache
 		if (value == null) {
 			clearVariable(root, parts, 0, isList);
 		} else {
 			setSingleVariable(root, parts, value);
-		}
-
-		// invalidate the exact key
-		cache.invalidate(name);
-
-		// invalidate all parents
-		if (!isList) {
-			StringBuilder buffer = new StringBuilder();
-			for (int i = 0; i < parts.length - 1 /* -1 because we invalidate parents */; i++) {
-				if (i > 0)
-					buffer.append(Variable.SEPARATOR);
-				buffer.append(parts[i]);
-				cache.invalidate(buffer + Variable.SEPARATOR + "*");
-			}
-		}
-
-		// invalidate children
-		if (isList) {
-			String prefix = actualName + Variable.SEPARATOR;
-			cache.asMap().keySet().removeIf(k -> k.startsWith(prefix));
 		}
 	}
 
@@ -369,7 +307,7 @@ public final class VariablesMap {
 						stamp = ws;
 					}
 					if (current.children == null)
-						current.children = new TreeMap<>(VARIABLE_NAME_COMP);
+						current.children = new HashMap<>();
 					// could already be added during the waiting on the write lock
 					current.children.putIfAbsent(key, new Node());
 				}
@@ -465,7 +403,7 @@ public final class VariablesMap {
 			target.value = source.value;
 			if (source.hasChildren()) {
 				assert source.children != null;
-				target.children = new TreeMap<>(VARIABLE_NAME_COMP);
+				target.children = new HashMap<>();
 				source.children.forEach((key, sourceChild) -> {
 					Node targetChild = new Node();
 					copy(sourceChild, targetChild);
