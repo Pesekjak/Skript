@@ -10,8 +10,11 @@ import org.jetbrains.annotations.Unmodifiable;
 import java.util.*;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
+import java.util.function.Function;
 
 /**
  * A thread-safe, memory-efficient Radix Tree for storing variables.
@@ -330,8 +333,10 @@ public final class VariablesMap {
 	 *
 	 * @param name the variable name.
 	 * @param value the variable value, {@code null} to delete the variable.
+	 * @return previous value for changed variable, {@code null} if not set or
+	 * the variable is a list that was cleared
 	 */
-	public void setVariable(String name, @Nullable Object value) {
+	public @Nullable Object setVariable(String name, @Nullable Object value) {
 		boolean isList = name.endsWith(Variable.SEPARATOR + "*");
 
 		String actualName = isList
@@ -345,22 +350,47 @@ public final class VariablesMap {
 		String[] parts = Variables.splitVariableName(actualName);
 
 		if (value == null) {
-			clearVariable(root, parts, isList);
+			return clearVariable(root, parts, isList);
 		} else {
-			setSingleVariable(root, parts, value);
+			return modifySingleVariable(root, parts, node -> node.value = value);
 		}
 	}
 
 	/**
-	 * Optimized iterative setter for single non-null values.
+	 * Returns the variable with given name and if there is none set, sets it to
+	 * the next value provided by the mapping function.
 	 * <p>
-	 * Traversals use read locks, write lock is only acquired at the specific node
-	 * that needs modification.
+	 * This method only accepts single variables.
 	 * <p>
-	 * This is possible because prune does not happen when setting non-null values (the
-	 * parent nodes are not modified on the way back)
+	 * The {@code mappingFunction} is executed under a write lock on the variable's node.
+	 * Do not perform expensive operations or access other variables inside this function to avoid
+	 * deadlock and performance degradation.
+	 *
+	 * @param name the variable name.
+	 * @param mappingFunction function providing the new value in case it is not set
+	 * @return current value of the variable
 	 */
-	private void setSingleVariable(Node root, String[] parts, Object value) {
+	public Object computeIfAbsent(String name, Function<? super String, ? super Object> mappingFunction) {
+		Preconditions.checkState(!name.endsWith(Variable.SEPARATOR + "*"));
+		AtomicReference<Object> got = new AtomicReference<>();
+		String[] parts = Variables.splitVariableName(name);
+		modifySingleVariable(root, parts, node -> {
+			if (node.value == null)
+				node.value = mappingFunction.apply(name);
+			got.set(node.value);
+		});
+		return got.get();
+	}
+
+	/**
+	 * Applies operation at node of given variable under its write lock.
+	 *
+	 * @param root root node
+	 * @param parts parts of the variable
+	 * @param operation operation to apply
+	 * @return value associated with the node before the operation
+	 */
+	private @Nullable Object modifySingleVariable(Node root, String[] parts, Consumer<Node> operation) {
 		Node current = root;
 		long stamp = current.lock.readLock();
 		try {
@@ -398,20 +428,27 @@ public final class VariablesMap {
 				stamp = nextStamp;
 
 				if (isLast) {
-					current.value = value; // we have write lock
-					return;
+					Object previous = current.value;
+					operation.accept(current);
+					return previous;
 				}
 			}
 		} finally {
 			// unlock the final node
 			current.unlock(stamp);
 		}
+		return null;
 	}
 
 	/**
 	 * Iterative setter for clearing values.
+	 *
+	 * @param root root node
+	 * @param parts parts of the variable to clear
+	 * @param isListClear whether this is a list clear
+	 * @return cleared object if {@code isListClear} is false, else null
 	 */
-	private void clearVariable(Node root, String[] parts, boolean isListClear) {
+	private @Nullable Object clearVariable(Node root, String[] parts, boolean isListClear) {
 		Node current = root;
 		long stamp = current.lock.readLock();
 		boolean prune = false;
@@ -422,7 +459,7 @@ public final class VariablesMap {
 
 				// if child does not exist there is nothing to clear
 				if (current.children == null || !current.children.containsKey(key))
-					return; // unlocks in the finally block
+					return null; // unlocks in the finally block
 
 				Node next = current.children.get(key);
 				// for last node we write the value
@@ -434,9 +471,13 @@ public final class VariablesMap {
 				stamp = nextStamp;
 
 				if (isLast) {
+					Object previous;
+
 					if (isListClear) {
+						previous = null;
 						current.children = null;
 					} else {
+						previous = current.value;
 						current.value = null;
 					}
 
@@ -449,7 +490,7 @@ public final class VariablesMap {
 								prune = true;
 						}
 					}
-					return;
+					return previous;
 				}
 			}
 		} finally {
@@ -457,6 +498,7 @@ public final class VariablesMap {
 			if (prune)
 				pruneExecutor.execute(this::prune);
 		}
+		return null;
 	}
 
 	/**

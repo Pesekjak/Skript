@@ -82,20 +82,6 @@ public final class SkriptAddon implements org.skriptlang.skript.addon.SkriptAddo
 	}
 
 	/**
-	 * Register a VariableStorage class for Skript to create if the user config value matches.
-	 * 
-	 * @param <T> A class to extend VariableStorage.
-	 * @param storage The class of the VariableStorage implementation.
-	 * @param names The names used in the config of Skript to select this VariableStorage.
-	 * @return This SkriptAddon for method chaining.
-	 * @throws SkriptAPIException if the operation was not successful because the storage class is already registered.
-	 */
-	public <T extends VariableStorage> SkriptAddon registerStorage(Class<T> storage, String... names) throws SkriptAPIException {
-		Variables.registerStorage(this, storage, names);
-		return this;
-	}
-
-	/**
 	 * Makes Skript load language files from the specified directory, e.g. "lang" or "skript lang" if you have a lang folder yourself. Localised files will be read from the
 	 * plugin's jar and the plugin's data folder, but the default English file is only taken from the jar and <b>must</b> exist!
 	 * 

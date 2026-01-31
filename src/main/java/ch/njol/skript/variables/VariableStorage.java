@@ -1,56 +1,42 @@
 package ch.njol.skript.variables;
 
+import java.io.Closeable;
 import java.io.File;
 import java.io.IOException;
-import java.util.HashSet;
 import java.util.Set;
-import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
+import com.google.errorprone.annotations.ThreadSafe;
+import org.jetbrains.annotations.Blocking;
 import org.jetbrains.annotations.Nullable;
 import ch.njol.skript.Skript;
-import ch.njol.skript.SkriptAddon;
 import ch.njol.skript.config.SectionNode;
 import ch.njol.skript.lang.ParseContext;
 import ch.njol.skript.log.ParseLogHandler;
 import ch.njol.skript.log.SkriptLogger;
 import ch.njol.skript.registrations.Classes;
-import ch.njol.skript.util.FileUtils;
-import ch.njol.skript.util.Task;
-import ch.njol.skript.util.Timespan;
-import ch.njol.skript.util.Timespan.TimePeriod;
-import ch.njol.skript.variables.SerializedVariable.Value;
-import ch.njol.util.Closeable;
+import org.jetbrains.annotations.VisibleForTesting;
+import org.skriptlang.skript.addon.SkriptAddon;
 
 /**
  * A variable storage is holds the means and methods of storing variables.
- * <p>
  * This is usually some sort of database, and could be as simply as a text file.
- *
- * @see FlatFileStorage
- * @see DatabaseStorage
+ * <p>
+ * Variable storage itself is responsible for variable management, read and write requests,
+ * and loading and unloading the variables to memory.
+ * <p>
+ * For storing variables on heap, see {@link VariablesMap} which provides thread safe
+ * implementation for on heap variable storage.
  */
-// FIXME ! large databases (>25 MB) cause the server to be unresponsive instead of loading slowly
-@SuppressWarnings({"SuspiciousIndentAfterControlStatement", "removal"})
+@ThreadSafe
 public abstract class VariableStorage implements Closeable {
 
 	/**
-	 * The size of the variable changes queue.
+	 * Source of the variable storage.
 	 */
-	private static final int QUEUE_SIZE = 1000;
-	/**
-	 * The threshold of the size of the variable change
-	 * after which a warning will be sent.
-	 */
-	private static final int FIRST_WARNING = 300;
-
-	final LinkedBlockingQueue<SerializedVariable> changesQueue = new LinkedBlockingQueue<>(QUEUE_SIZE);
-
-	/**
-	 * Whether this variable storage has been {@link #close() closed}.
-	 */
-	protected volatile boolean closed = false;
+	private final SkriptAddon source;
 
 	/**
 	 * The name of the database
@@ -66,54 +52,18 @@ public abstract class VariableStorage implements Closeable {
 	 * The file associated with this variable storage.
 	 * Can be {@code null} if no file is required.
 	 */
-	@Nullable
-	protected File file;
+	protected @Nullable File file;
 
 	/**
 	 * The pattern of the variable name this storage accepts.
 	 * {@code null} for '{@code .*}' or '{@code .*}'.
 	 */
-	@Nullable
-	private Pattern variableNamePattern;
+	private @Nullable Pattern variableNamePattern;
 
-	/**
-	 * The thread used for writing variables to the storage.
-	 */
-	// created in the constructor, started in load()
-	private final Thread writeThread;
-	private final SkriptAddon source;
-
-	/**
-	 * Creates a new variable storage with the given name.
-	 * <p>
-	 * This will also create the {@link #writeThread}, but it must be started
-	 * with {@link #loadConfig(SectionNode)}.
-	 *
-	 * @param source the SkriptAddon instance that registered this VariableStorage.
-	 * @param type the database type i.e. CSV.
-	 */
 	protected VariableStorage(SkriptAddon source, String type) {
 		assert type != null;
-		this.databaseType = type;
 		this.source = source;
-
-		writeThread = Skript.newThread(() -> {
-			while (!closed) {
-				try {
-					// Take a variable from the queue and process it
-					SerializedVariable variable = changesQueue.take();
-					Value value = variable.value();
-
-					// Actually save the variable
-					if (value != null)
-						save(variable.name(), value.type(), value.data());
-					else
-						save(variable.name(), null, null);
-				} catch (InterruptedException ignored) {
-					// Ignored as the `closed` field will indicate whether the thread actually needs to stop
-				}
-			}
-		}, "Skript variable save thread for database '" + type + "'");
+		this.databaseType = type;
 	}
 
 	/**
@@ -154,8 +104,7 @@ public abstract class VariableStorage implements Closeable {
 	 * @return the value, or {@code null} if the value was invalid,
 	 * or not found.
 	 */
-	@Nullable
-	protected final String getValue(SectionNode sectionNode, String key) {
+	protected final @Nullable String getValue(SectionNode sectionNode, String key) {
 		return getValue(sectionNode, key, String.class);
 	}
 
@@ -170,8 +119,7 @@ public abstract class VariableStorage implements Closeable {
 	 * or not found.
 	 * @param <T> the type.
 	 */
-	@Nullable
-	protected final <T> T getValue(SectionNode sectionNode, String key, Class<T> type) {
+	protected final <T> @Nullable T getValue(SectionNode sectionNode, String key, Class<T> type) {
 		return getValue(sectionNode, key, type, true);
 	}
 
@@ -186,8 +134,7 @@ public abstract class VariableStorage implements Closeable {
 	 * or not found.
 	 * @param <T> the type.
 	 */
-	@Nullable
-	protected final <T> T getOptional(SectionNode sectionNode, String key, Class<T> type) {
+	protected final <T> @Nullable T getOptional(SectionNode sectionNode, String key, Class<T> type) {
 		return getValue(sectionNode, key, type, false);
 	}
 
@@ -203,8 +150,7 @@ public abstract class VariableStorage implements Closeable {
 	 * or not found.
 	 * @param <T> the type.
 	 */
-	@Nullable
-	private <T> T getValue(SectionNode sectionNode, String key, Class<T> type, boolean error) {
+	private <T> @Nullable T getValue(SectionNode sectionNode, String key, Class<T> type, boolean error) {
 		String rawValue = sectionNode.getValue(key);
 		if (rawValue == null) {
 			if (error)
@@ -214,7 +160,6 @@ public abstract class VariableStorage implements Closeable {
 
 		try (ParseLogHandler log = SkriptLogger.startParseLogHandler()) {
 			T parsedValue = Classes.parse(rawValue, type, ParseContext.CONFIG);
-
 			if (parsedValue == null && error)
 				// Parsing failed
 				log.printError("The entry for '" + key + "' in the database '" + databaseName + "' must be " +
@@ -226,16 +171,21 @@ public abstract class VariableStorage implements Closeable {
 		}
 	}
 
-	private static final Set<File> registeredFiles = new HashSet<>();
+	private static final Set<File> registeredFiles = ConcurrentHashMap.newKeySet();
 
 	/**
 	 * Loads the configuration for this variable storage
 	 * from the given section node. Loads internal required values first in loadConfig.
 	 * {@link #load(SectionNode)} is for extending classes.
+	 * <p>
+	 * This operation may be blocking if the variable storage deserializes some stored variables
+	 * as some deserializers must be synced on the main thread.
 	 *
 	 * @param sectionNode the section node.
 	 * @return whether the loading succeeded.
 	 */
+	@Blocking
+	@VisibleForTesting
 	public final boolean loadConfig(SectionNode sectionNode) {
 		databaseName = sectionNode.getKey();
 		String pattern = getValue(sectionNode, "pattern");
@@ -256,7 +206,7 @@ public abstract class VariableStorage implements Closeable {
 			if (fileName == null)
 				return false;
 
-			this.file = getFile(fileName).getAbsoluteFile();
+			file = getFile(fileName).getAbsoluteFile();
 
 			if (file.exists() && !file.isFile()) {
 				Skript.error("The database file '" + file.getName() + "' must be an actual file, not a directory.");
@@ -265,8 +215,10 @@ public abstract class VariableStorage implements Closeable {
 
 			// Create the file if it does not exist yet
 			try {
-				//noinspection ResultOfMethodCallIgnored
-				file.createNewFile();
+				if (!file.exists() && !file.createNewFile()) {
+					Skript.error("Cannot create the database file '" + file.getName() + "'");
+					return false;
+				}
 			} catch (IOException e) {
 				Skript.error("Cannot create the database file '" + file.getName() + "': " + e.getLocalizedMessage());
 				return false;
@@ -287,67 +239,42 @@ public abstract class VariableStorage implements Closeable {
 				return false;
 			}
 			registeredFiles.add(file);
-
-			// Set the backup interval, if present & enabled
-			if (!"0".equals(getValue(sectionNode, "backup interval"))) {
-				Timespan backupInterval = getValue(sectionNode, "backup interval", Timespan.class);
-				int toKeep = getValue(sectionNode, "backups to keep", Integer.class);
-				boolean removeBackups = false;
-				boolean startBackup = true;
-				if (backupInterval != null)
-					if (toKeep == 0) {
-						startBackup = false;
-					} else if (toKeep >= 1) {
-						removeBackups = true;
-					}
-					if (startBackup) {
-						startBackupTask(backupInterval, removeBackups, toKeep);
-					} else {
-						try {
-							FileUtils.backupPurge(file, toKeep);
-						} catch (IOException e) {
-							Skript.error("Variables backup wipe failed: " + e.getLocalizedMessage());
-						}
-					}
-			}
 		}
 
 		// Load the entries custom to the variable storage
-		if (!loadAbstract(sectionNode))
-			return false;
-
-		writeThread.start();
-		Skript.closeOnDisable(this);
-		return true;
+		return loadAbstract(sectionNode);
 	}
 
 	/**
 	 * Used for abstract extending classes intercepting the
 	 * configuration before sending to the final implementation class.
-	 * 
+	 * <p>
 	 * Override to use this method in AnotherAbstractClass;
 	 * VariablesStorage -> AnotherAbstractClass -> FinalImplementation
+	 * <p>
+	 * This operation may be blocking if the variable storage deserializes some stored variables
+	 * as some deserializers must be synced on the main thread.
+	 *
+	 * @param sectionNode the section node.
+	 * @return whether the loading succeeded.
 	 */
+	@Blocking
 	protected boolean loadAbstract(SectionNode sectionNode) {
 		return load(sectionNode);
 	}
 
 	/**
 	 * Loads variables stored here.
+	 * <p>
+	 * This operation may be blocking if the variable storage deserializes some stored variables
+	 * as some deserializers must be synced on the main thread.
 	 *
+	 * @param sectionNode the section node.
 	 * @return Whether the database could be loaded successfully,
 	 * i.e. whether the config is correct and all variables could be loaded.
 	 */
-	protected abstract boolean load(SectionNode n);
-
-	/**
-	 * Called after all storages have been loaded, and variables
-	 * have been redistributed if settings have changed.
-	 * This should commit the first transaction (which is not empty if
-	 * variables have been moved from another database to this one or vice versa),
-	 * and start repeating transactions if applicable.
-	 */
-	protected abstract void allLoaded();
+	@Blocking
+	protected abstract boolean load(SectionNode sectionNode);
 
 	/**
 	 * Checks if this storage requires a file for storing its data.
@@ -367,87 +294,57 @@ public abstract class VariableStorage implements Closeable {
 	protected abstract File getFile(String fileName);
 
 	/**
-	 * Must be locked after {@link Variables#getReadLock()}
-	 * (if that lock is used at all).
-	 */
-	protected final Object connectionLock = new Object();
-
-	/**
-	 * (Re)connects to the database.
+	 * Reads a variable with given name from this storage.
 	 * <p>
-	 * Not called on the first connect: do this in {@link #load(SectionNode)}.
-	 * An error should be printed by this method
-	 * prior to returning {@code false}.
+	 * The format of returned value follows {@link VariablesMap#getVariable(String)}.
+	 * <p>
+	 * This method must be thread safe.
 	 *
-	 * @return whether the connection could be re-established.
+	 * @param name name of the variable
+	 * @return value of the variable
 	 */
-	protected abstract boolean connect();
+	public abstract @Nullable Object getVariable(String name);
 
 	/**
-	 * Disconnects from the database.
-	 */
-	protected abstract void disconnect();
-
-	/**
-	 * The backup task, or {@code null} if automatic backups are disabled.
-	 */
-	@Nullable
-	protected Task backupTask = null;
-
-	/**
-	 * Starts the backup task, with the given backup interval.
+	 * Sets the given variable to the given value.
+	 * <p>
+	 * This method accepts list variables,
+	 * but these may only be set to {@code null}.
+	 * <p>
+	 * This method must be thread safe.
 	 *
-	 * @param backupInterval the backup interval.
+	 * @param name the variable name.
+	 * @param value the variable value, {@code null} to delete the variable.
 	 */
-	public void startBackupTask(Timespan backupInterval, boolean removeBackups, int toKeep) {
-		// File is null or backup interval is invalid
-		var backupIntervalTicks = backupInterval.getAs(TimePeriod.TICK);
-		if (file == null || backupIntervalTicks <= 0)
-			return;
-		backupTask = new Task(Skript.getInstance(), backupIntervalTicks, backupIntervalTicks, true) {
-			@Override
-			public void run() {
-				synchronized (connectionLock) {
-					// Disconnect,
-					disconnect();
-					try {
-						// ..., then backup
-						FileUtils.backup(file);
-						if (removeBackups) {
-							try {
-								FileUtils.backupPurge(file, toKeep);
-							} catch (IOException | IllegalArgumentException e) {
-								Skript.error("Automatic variables backup purge failed: " + e.getLocalizedMessage());
-							}
-						}
-					} catch (IOException e) {
-						Skript.error("Automatic variables backup failed: " + e.getLocalizedMessage());
-					} finally {
-						// ... and reconnect
-						connect();
-					}
-				}
-			}
-		};
-	}
+	public abstract void setVariable(String name, @Nullable Object value);
+
+	/**
+	 * Returns the number of currently loaded variables.
+	 * <p>
+	 * This number may not be fully accurate.
+	 *
+	 * @return number of loaded variables
+	 */
+	public abstract long loadedVariables();
+
+	// TODO backups
 
 	/**
 	 * Checks if this variable storage accepts the given variable name.
 	 *
 	 * @param var the variable name.
 	 * @return if this storage accepts the variable name.
-	 *
 	 * @see #variableNamePattern
 	 */
-	boolean accept(@Nullable String var) {
+	public boolean accept(@Nullable String var) {
 		if (var == null)
 			return false;
-
 		return variableNamePattern == null || variableNamePattern.matcher(var).matches();
 	}
 
 	/**
 	 * Returns the name pattern accepted by this variable storage
+	 *
 	 * @return the name pattern, or null if accepting all
 	 */
 	public @Nullable Pattern getNamePattern() {
@@ -455,113 +352,9 @@ public abstract class VariableStorage implements Closeable {
 	}
 
 	/**
-	 * The interval between warnings that many variables are being written
-	 * at once, in seconds.
-	 */
-	private static final int WARNING_INTERVAL = 10;
-	/**
-	 * The interval between errors that too many variables are being written
-	 * at once, in seconds.
-	 */
-	private static final int ERROR_INTERVAL = 10;
-
-	/**
-	 * The last time a warning was printed for many variables in the queue.
-	 */
-	private long lastWarning = Long.MIN_VALUE;
-	/**
-	 * The last time an error was printed for too many variables in the queue.
-	 */
-	private long lastError = Long.MIN_VALUE;
-
-	/**
-	 * Saves the given serialized variable.
-	 * <p>
-	 * May be called from a different thread than Bukkit's main thread.
-	 *
-	 * @param var the serialized variable.
-	 */
-	final void save(SerializedVariable var) {
-		if (changesQueue.size() > FIRST_WARNING && lastWarning < System.currentTimeMillis() - WARNING_INTERVAL * 1000) {
-			// Too many variables queued up to save, warn the server
-			Skript.warning("Cannot write variables to the database '" + databaseName + "' at sufficient speed; " +
-				"server performance may suffer and many variables will be lost if the server crashes. " +
-				"(this warning will be repeated at most once every " + WARNING_INTERVAL + " seconds)");
-
-			lastWarning = System.currentTimeMillis();
-		}
-
-		if (!changesQueue.offer(var)) {
-			// Variable changes queue filled up
-
-			if (lastError < System.currentTimeMillis() - ERROR_INTERVAL * 1000) {
-				// Inform console about overload of variable changes
-				Skript.error("Skript cannot save any variables to the database '" + databaseName + "'. " +
-					"The server will hang and may crash if no more variables can be saved.");
-
-				lastError = System.currentTimeMillis();
-			}
-
-			// Halt thread until variables queue starts clearing up
-			while (true) {
-				try {
-					// REMIND add repetitive error and/or stop saving variables altogether?
-					changesQueue.put(var);
-					break;
-				} catch (InterruptedException ignored) {}
-			}
-		}
-	}
-
-	/**
 	 * Called when Skript gets disabled.
-	 * <p>
-	 * The default implementation will wait for all variables to be saved
-	 * before setting {@link #closed} to {@code true} and stopping
-	 * the {@link #writeThread write thread}.
-	 * <p>
-	 * Therefore, make sure to call {@code super.close()}
-	 * if this method is overridden.
 	 */
 	@Override
-	public void close() {
-		// Wait for all variable changes to be processed
-		while (changesQueue.size() > 0) {
-			try {
-				Thread.sleep(10);
-			} catch (InterruptedException ignored) {}
-		}
-
-		// Now safely close storage and interrupt thread
-		closed = true;
-		writeThread.interrupt();
-	}
-
-	/**
-	 * Clears the {@link #changesQueue queue} of unsaved variables.
-	 * <p>
-	 * Only used if all variables are saved immediately
-	 * after calling this method.
-	 */
-	protected final void clearChangesQueue() {
-		changesQueue.clear();
-	}
-
-	/**
-	 * Saves a variable.
-	 * <p>
-	 * This is called from the main thread
-	 * while variables are transferred between databases,
-	 * and from the {@link #writeThread} afterwards.
-	 * <p>
-	 * {@code type} and {@code value} are <i>both</i> {@code null}
-	 * iff this call is to delete the variable.
-	 *
-	 * @param name the name of the variable.
-	 * @param type the type of the variable.
-	 * @param value the serialized value of the variable.
-	 * @return Whether the variable was saved.
-	 */
-	protected abstract boolean save(String name, @Nullable String type, @Nullable byte[] value);
+	public abstract void close();
 
 }

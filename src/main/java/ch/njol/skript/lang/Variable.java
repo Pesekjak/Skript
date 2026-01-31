@@ -405,7 +405,7 @@ public class Variable<T> implements Expression<T>, KeyReceiverExpression<T>, Key
 		return Iterators.filter(transformed, Objects::nonNull);
 	}
 
-	public Iterator<Pair<String, Object>> variablesIterator(Event event) {
+	public Iterator<KeyedValue<Object>> variablesIterator(Event event) {
 		if (!list)
 			throw new SkriptAPIException("Looping a non-list variable");
 		return Variables.getVariableIterator(name.toString(event), local, event);
