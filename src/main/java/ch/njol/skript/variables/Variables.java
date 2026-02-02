@@ -396,8 +396,7 @@ public final class Variables {
 	/**
 	 * Returns the value of the requested variable.
 	 * <p>
-	 * In case of list variables, the returned map is not the backing map
-	 * of the variables map and can be edited safely (is modifiable).
+	 * In case of list variables, the returned map is unmodifiable view of the variables map.
 	 * <p>
 	 * If map is returned, it is sorted using a comparator that matches the variable name sorting.
 	 * <p>
@@ -527,7 +526,6 @@ public final class Variables {
 
 			// Get the variables map and set the variable in it
 			getLocalVariables(event).setVariable(fixedName, value);
-			assert value != null ^ getVariable(name, event, true) == null;
 			return;
 		}
 

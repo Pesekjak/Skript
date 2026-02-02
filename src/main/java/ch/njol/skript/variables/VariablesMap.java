@@ -4,6 +4,7 @@ import ch.njol.skript.lang.Variable;
 import ch.njol.util.StringUtils;
 import com.google.common.base.Preconditions;
 import com.google.errorprone.annotations.ThreadSafe;
+import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
@@ -224,8 +225,7 @@ public final class VariablesMap {
 	/**
 	 * Returns the value of the requested variable.
 	 * <p>
-	 * In case of list variables, the returned map is not the backing map
-	 * of the variables map and can be edited safely (is modifiable).
+	 * In case of list variables, the returned map is unmodifiable view of the variables map.
 	 * <p>
 	 * If map is returned, it is sorted using a comparator that matches the variable name sorting.
 	 * <p>
@@ -274,54 +274,12 @@ public final class VariablesMap {
 			}
 
 			if (isList) {
-				if (!current.hasChildren())
-					return null;
-				assert current.children != null;
-				Map<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
-				current.children.forEach((key, child) -> {
-					Object resolved = resolve(child);
-					if (resolved != null)
-						map.put(key, resolved);
-				});
-
-				return map.isEmpty() ? null : map;
+				return new WrappedMap(current, false);
 			} else {
 				return current.value;
 			}
 		} finally {
 			current.lock.unlockRead(stamp);
-		}
-	}
-
-	/**
-	 * Converts the node into its object representation.
-	 * <p>
-	 * That is either a TreeMap or its value if it has no children.
-	 *
-	 * @param node node
-	 * @return node as object
-	 */
-	private Object resolve(Node node) {
-		long stamp = node.lock.readLock();
-		try {
-			if (node.isEmpty())
-				return null;
-			if (!node.hasChildren())
-				return node.value;
-			TreeMap<String, Object> map = new TreeMap<>(VARIABLE_NAME_COMP);
-			if (node.value != null)
-				map.put(null, node.value);
-			if (node.hasChildren()) {
-				assert node.children != null;
-				node.children.forEach((key, child) -> {
-					Object resolved = resolve(child);
-					if (resolved != null)
-						map.put(key, resolved);
-				});
-			}
-			return map.isEmpty() ? null : map;
-		} finally {
-			node.lock.unlockRead(stamp);
 		}
 	}
 
@@ -570,7 +528,7 @@ public final class VariablesMap {
 	 * @return whether the variables map is empty
 	 */
 	public boolean isEmpty() {
-		return root.isEmpty();
+		return size() == 0;
 	}
 
 	/**
@@ -635,6 +593,98 @@ public final class VariablesMap {
 			node.lock.unlockRead(stamp);
 		}
 		return size;
+	}
+
+	/**
+	 * Map implementation that wraps around existing {@link Node}.
+	 * <p>
+	 * This map can not be modified.
+	 */
+	private static final class WrappedMap extends AbstractMap<String, Object> {
+
+		/**
+		 * Node this map wraps around.
+		 */
+		final Node node;
+
+		/**
+		 * If the map includes the value of the wrapped node itself.
+		 * <p>
+		 * If yes, it is mapped under the {@code null} key.
+		 */
+		final boolean includeValue;
+
+		WrappedMap(Node node, boolean includeValue) {
+			this.node = node;
+			this.includeValue = includeValue;
+		}
+
+		@Override
+		public boolean containsKey(Object key) {
+			return get(key) != null;
+		}
+
+		@Override
+		public Object get(Object key) {
+			long stamp = node.lock.readLock();
+			try {
+				if (includeValue && key == null)
+					return node.value;
+				if (node.children == null)
+					return null;
+				Node child = node.children.get(key);
+				if (child == null)
+					return null;
+				long childLock = child.lock.readLock();
+				try {
+					if (!child.hasChildren())
+						return child.value;
+					return new WrappedMap(child, true);
+				} finally {
+					child.lock.unlockRead(childLock);
+				}
+			} finally {
+				node.lock.unlockRead(stamp);
+			}
+		}
+
+		@Override
+		public @NotNull Set<Entry<String, Object>> entrySet() {
+			long stamp = node.lock.readLock();
+			try {
+				Set<Entry<String, Object>> set = new LinkedHashSet<>();
+				if (includeValue && node.value != null)
+					set.add(new SimpleEntry<>(null, node.value));
+
+				if (node.children == null)
+					return set;
+
+				node.children.entrySet().stream()
+					.sorted((first, second) ->
+						VARIABLE_NAME_COMP.compare(first.getKey(), second.getKey()))
+					.map(entry -> {
+						Node childNode = entry.getValue();
+						long childLock = childNode.lock.readLock();
+						try {
+							Object mapped;
+							if (childNode.hasChildren()) {
+								mapped = new WrappedMap(childNode, true);
+							} else {
+								mapped = childNode.value;
+							}
+							return new SimpleEntry<>(entry.getKey(), mapped);
+						} finally {
+							childNode.lock.unlockRead(childLock);
+						}
+					})
+					.forEach(set::add);
+
+				return set;
+			} finally {
+				node.lock.unlockRead(stamp);
+			}
+		}
+
 	}
 
 }
