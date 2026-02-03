@@ -12,6 +12,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.Comparator;
+import java.util.zip.Deflater;
 import java.util.zip.GZIPOutputStream;
 
 /**
@@ -96,9 +97,16 @@ public abstract class FileUtils {
 		if (Files.exists(backup))
 			throw new IOException("Backup file " + backup.getFileName() + " already exists");
 
+		class GZIPOutputStreamWithLevel extends GZIPOutputStream {
+			public GZIPOutputStreamWithLevel(OutputStream out, int level) throws IOException {
+				super(out);
+				def.setLevel(level);
+			}
+		}
+
 		if (compress) {
 			try (OutputStream os = Files.newOutputStream(backup);
-				 GZIPOutputStream gzipOs = new GZIPOutputStream(os)) {
+				 var gzipOs = new GZIPOutputStreamWithLevel(os, Deflater.BEST_COMPRESSION)) {
 				Files.copy(source, gzipOs);
 			}
 		} else {
