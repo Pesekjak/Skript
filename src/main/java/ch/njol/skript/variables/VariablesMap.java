@@ -3,12 +3,14 @@ package ch.njol.skript.variables;
 import ch.njol.skript.lang.Variable;
 import ch.njol.util.StringUtils;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Iterators;
 import com.google.errorprone.annotations.ThreadSafe;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.*;
+import java.util.concurrent.ConcurrentSkipListMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -18,7 +20,7 @@ import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
- * A thread-safe, memory-efficient Radix Tree for storing variables.
+ * A thread-safe Radix Tree for storing variables.
  */
 @ThreadSafe
 public final class VariablesMap {
@@ -131,24 +133,134 @@ public final class VariablesMap {
 
 	/**
 	 * A node in the radix tree.
+	 * <p>
+	 * This also serves as a thread safe unmodifiable live view of the tree branch branch in
+	 * the format returned by {@link #getVariable(String)}.
+	 * <p>
+	 * It does not lock the tree and is weakly consistent, modifications to the underlying
+	 * variables map by other threads may not be immediately visible, prioritizing performance
+	 * over strict in time snapshots. There is no way to verify whether the node is still
+	 * valid (part of the tree).
 	 */
-	private static class Node {
+	private static class Node extends AbstractMap<String, Object> {
+
+		/**
+		 * Reentrant lock that is locked when entering to the node
+		 * and released when exiting from the node.
+		 * <p>
+		 * During the traversal, the thread always holds at least one lock,
+		 * that means before releasing the lock of the previous node,
+		 * the lock of the next one is acquired (hand-over-hand locking)
+		 * to ensure safe traversal.
+		 * <p>
+		 * Write lock is acquired only when updating either the value
+		 * of the node or modifying the children map (when child is missing
+		 * during the set operation).
+		 */
 		final StampedLock lock = new StampedLock();
-		@Nullable Object value;
-		@Nullable Map<String, Node> children;
+
+		/**
+		 * Value assigned to this variables map node.
+		 * <p>
+		 * It is marked as volatile to ensure that the node does
+		 * always access the current version of its value when
+		 * acting as a live view of the tree branch.
+		 * <p>
+		 * {@code null} if the variable is not set
+		 */
+		volatile @Nullable Object value;
+
+		/**
+		 * Children of this node.
+		 * <p>
+		 * This uses {@link ConcurrentSkipListMap} because:
+		 * <br>
+		 * <li>The iterator used by the live-view of this node must be thread safe</li>
+		 * <li>The children need to be sorted by the variables name compare</li>
+		 * </br>
+		 * This allows us to use the live view of this map as a view of this node
+		 * (if correctly lazily transformed).
+		 */
+		final Map<String, Node> children = new ConcurrentSkipListMap<>(VARIABLE_NAME_COMP);
 
 		/**
 		 * @return whether the node has children
 		 */
 		boolean hasChildren() {
-			return children != null && !children.isEmpty();
+			return !children.isEmpty();
 		}
 
 		/**
 		 * @return whether the node is empty (has no value and no children)
 		 */
-		boolean isEmpty() {
+		@Override
+		public boolean isEmpty() {
 			return value == null && !hasChildren();
+		}
+
+		@Override
+		public int size() {
+			int size = children.size();
+			return value != null ? ++size : size; // include the value if present as it is mapped to null key
+		}
+
+		@Override
+		public boolean containsKey(Object key) {
+			return get(key) != null;
+		}
+
+		@Override
+		public Object get(Object key) {
+			if (key == null)
+				return value;
+			Node child = children.get(key);
+			return child != null ? child.unwrap() : null;
+		}
+
+		@Override
+		public @NotNull Set<Entry<String, Object>> entrySet() {
+			return new AbstractSet<>() {
+				@Override
+				@SuppressWarnings({"rawtypes", "unchecked"})
+				public @NotNull Iterator iterator() {
+					Object value = Node.this.value;
+
+					Iterator<Entry<String, Node>> wrapped = children.entrySet().iterator();
+					Iterator<Entry<String, Object>> iterator;
+
+					if (value != null) {
+						// concat iterator with the value of this node if present
+						Iterator<Entry<String, Object>> itself =
+							(Iterator) Collections.singleton(new SimpleEntry<>(null, value)).iterator();
+						// source iterators are not polled until necessary, the null key is first
+						iterator = Iterators.concat(itself, (Iterator) wrapped);
+					} else {
+						iterator = (Iterator) wrapped;
+					}
+
+					// this transformation is lazy
+					return Iterators.transform(iterator, entry -> {
+						if (entry.getKey() != null /* sub tree */) {
+							Node node = (Node) entry.getValue();
+							return new SimpleEntry<>(entry.getKey(), node.unwrap());
+						} else {
+							return entry; // null key with value of this node
+						}
+					});
+				}
+
+				@Override
+				public int size() {
+					return Node.this.size();
+				}
+			};
+		}
+
+		/**
+		 * @return returns the representation of this node in the exposed map
+		 */
+		private Object unwrap() {
+			return hasChildren() ? this : value;
 		}
 
 		/**
@@ -165,6 +277,7 @@ public final class VariablesMap {
 				lock.unlockRead(stamp);
 			}
 		}
+
 	}
 
 	/**
@@ -175,7 +288,7 @@ public final class VariablesMap {
 	/**
 	 * Estimate of empty branches in the radix tree.
 	 * <p>
-	 * The real number may be different as some branches may be populated after clear.
+	 * The real number may be different as some branches may be re-populated after clear.
 	 */
 	private final AtomicInteger leftEmpty = new AtomicInteger(0);
 
@@ -215,8 +328,6 @@ public final class VariablesMap {
 
 	/**
 	 * Constructs new variables map.
-	 *
-	 * @see #prune()
 	 */
 	public VariablesMap() {
 		this(Integer.MAX_VALUE, Runnable::run);
@@ -225,17 +336,17 @@ public final class VariablesMap {
 	/**
 	 * Returns the value of the requested variable.
 	 * <p>
-	 * In case of list variables, the returned map is unmodifiable view of the variables map.
+	 * In case of list variables, the returned map is thread safe unmodifiable live view of the variables map.
 	 * <p>
-	 * If map is returned, it is sorted using a comparator that matches the variable name sorting.
+	 * If map is returned, it is sorted using the variables name comparator.
 	 * <p>
 	 * If map is returned the structure is as following:
 	 * <ul>
 	 *     <li>
 	 *         If value is present for the variable and
 	 *         <ul>
-	 *             <li>the variable has no children, it is mapped directly to the key</li>
-	 *             <li>the variable has children it is mapped to a map, that maps {@code null} to its value and its
+	 *             <li>the variable has no children, its value is mapped directly to the key</li>
+	 *             <li>the variable has children, it is mapped to a map, that maps {@code null} to its value and its
 	 *             children are mapped using the same strategy</li>
 	 *         </ul>
 	 *     </li>
@@ -261,7 +372,6 @@ public final class VariablesMap {
 			for (String part : parts) {
 				if (!current.hasChildren())
 					return null;
-				assert current.children != null;
 				Node next = current.children.get(part);
 				if (next == null)
 					return null;
@@ -274,7 +384,7 @@ public final class VariablesMap {
 			}
 
 			if (isList) {
-				return new WrappedMap(current, false);
+				return current;
 			} else {
 				return current.value;
 			}
@@ -357,7 +467,7 @@ public final class VariablesMap {
 				boolean isLast = i == parts.length - 1;
 
 				// we need write lock if the child does not exist (to create the node in the map)
-				boolean childExists = current.children != null && current.children.containsKey(key);
+				boolean childExists = current.children.containsKey(key);
 
 				if (!childExists) {
 					// try to upgrade
@@ -369,13 +479,10 @@ public final class VariablesMap {
 					} else {
 						stamp = ws;
 					}
-					if (current.children == null)
-						current.children = new HashMap<>();
 					// could already be added during the waiting on the write lock
 					current.children.putIfAbsent(key, new Node());
 				}
 
-				assert current.children != null;
 				Node next = current.children.get(key);
 				// for last node we write the value
 				long nextStamp = isLast ? next.lock.writeLock() : next.lock.readLock();
@@ -416,7 +523,7 @@ public final class VariablesMap {
 				boolean isLast = i == parts.length - 1;
 
 				// if child does not exist there is nothing to clear
-				if (current.children == null || !current.children.containsKey(key))
+				if (!current.children.containsKey(key))
 					return null; // unlocks in the finally block
 
 				Node next = current.children.get(key);
@@ -433,7 +540,9 @@ public final class VariablesMap {
 
 					if (isListClear) {
 						previous = null;
-						current.children = null;
+						// TODO before this returns, it should block until there are no reads happening
+						//  in the subtrees, try implement this with Phaser (parenting Phasers may be useful)
+						current.children.clear();
 					} else {
 						previous = current.value;
 						current.value = null;
@@ -474,7 +583,6 @@ public final class VariablesMap {
 			if (node.isEmpty())
 				return true;
 
-			assert node.children != null;
 			var it = node.children.entrySet().iterator();
 			while (it.hasNext()) {
 				var entry = it.next();
@@ -482,9 +590,6 @@ public final class VariablesMap {
 				if (isChildEmpty)
 					it.remove();
 			}
-
-			if (node.children.isEmpty())
-				node.children = null;
 
 			return node.isEmpty();
 		} finally {
@@ -511,8 +616,6 @@ public final class VariablesMap {
 		try {
 			target.value = source.value;
 			if (source.hasChildren()) {
-				assert source.children != null;
-				target.children = new HashMap<>();
 				source.children.forEach((key, sourceChild) -> {
 					Node targetChild = new Node();
 					copy(sourceChild, targetChild);
@@ -555,7 +658,6 @@ public final class VariablesMap {
 			if (source.value != null)
 				collector.accept(buffer, source.value);
 			if (source.hasChildren()) {
-				assert source.children != null;
 				source.children.forEach((key, child) -> {
 					String nextName = buffer.isEmpty() ? key : buffer + Variable.SEPARATOR + key;
 					getAll(nextName, child, collector);
@@ -585,7 +687,6 @@ public final class VariablesMap {
 			if (node.value != null)
 				size++;
 			if (node.hasChildren()) {
-				assert node.children != null;
 				for (Node child : node.children.values())
 					size += size(child);
 			}
@@ -593,98 +694,6 @@ public final class VariablesMap {
 			node.lock.unlockRead(stamp);
 		}
 		return size;
-	}
-
-	/**
-	 * Map implementation that wraps around existing {@link Node}.
-	 * <p>
-	 * This map can not be modified.
-	 */
-	private static final class WrappedMap extends AbstractMap<String, Object> {
-
-		/**
-		 * Node this map wraps around.
-		 */
-		final Node node;
-
-		/**
-		 * If the map includes the value of the wrapped node itself.
-		 * <p>
-		 * If yes, it is mapped under the {@code null} key.
-		 */
-		final boolean includeValue;
-
-		WrappedMap(Node node, boolean includeValue) {
-			this.node = node;
-			this.includeValue = includeValue;
-		}
-
-		@Override
-		public boolean containsKey(Object key) {
-			return get(key) != null;
-		}
-
-		@Override
-		public Object get(Object key) {
-			long stamp = node.lock.readLock();
-			try {
-				if (includeValue && key == null)
-					return node.value;
-				if (node.children == null)
-					return null;
-				Node child = node.children.get(key);
-				if (child == null)
-					return null;
-				long childLock = child.lock.readLock();
-				try {
-					if (!child.hasChildren())
-						return child.value;
-					return new WrappedMap(child, true);
-				} finally {
-					child.lock.unlockRead(childLock);
-				}
-			} finally {
-				node.lock.unlockRead(stamp);
-			}
-		}
-
-		@Override
-		public @NotNull Set<Entry<String, Object>> entrySet() {
-			long stamp = node.lock.readLock();
-			try {
-				Set<Entry<String, Object>> set = new LinkedHashSet<>();
-				if (includeValue && node.value != null)
-					set.add(new SimpleEntry<>(null, node.value));
-
-				if (node.children == null)
-					return set;
-
-				node.children.entrySet().stream()
-					.sorted((first, second) ->
-						VARIABLE_NAME_COMP.compare(first.getKey(), second.getKey()))
-					.map(entry -> {
-						Node childNode = entry.getValue();
-						long childLock = childNode.lock.readLock();
-						try {
-							Object mapped;
-							if (childNode.hasChildren()) {
-								mapped = new WrappedMap(childNode, true);
-							} else {
-								mapped = childNode.value;
-							}
-							return new SimpleEntry<>(entry.getKey(), mapped);
-						} finally {
-							childNode.lock.unlockRead(childLock);
-						}
-					})
-					.forEach(set::add);
-
-				return set;
-			} finally {
-				node.lock.unlockRead(stamp);
-			}
-		}
-
 	}
 
 }
