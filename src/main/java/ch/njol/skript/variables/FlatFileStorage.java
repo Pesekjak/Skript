@@ -270,7 +270,9 @@ public class FlatFileStorage extends VariableStorage {
 		}
 		// it can not finish the save anyway because Skript is disabled and
 		// serialization will fail off main thread as it can not schedule
-		// tasks to serialize such variables
+		// tasks to serialize such variables.
+		// we can shutdown now as all variables are on heap and will be
+		// saved once again on the main thread
 		saveExecutor.shutdownNow();
 
 		// wait for the background thread to actually release the file

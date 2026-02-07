@@ -10,6 +10,7 @@ import java.io.File;
 import java.sql.Connection;
 import java.sql.PreparedStatement;
 import java.sql.SQLException;
+import java.sql.Statement;
 
 /**
  * H2 storage for Skript variables.
@@ -38,7 +39,14 @@ public class H2Storage extends JdbcStorage {
 		url += "file:" + file.getAbsolutePath();
 		url = url.substring(0, url.length() - ".mv.db".length());
 
-		configuration.addDataSourceProperty("URL", "jdbc:h2:" + url);
+		String h2Settings = ";COMPRESS=TRUE" +
+			";RETENTION_TIME=1000" +
+			";CACHE_SIZE=32768" +
+			";TRACE_LEVEL_FILE=0" +
+			";TRACE_LEVEL_SYSTEM_OUT=0" +
+			";DB_CLOSE_ON_EXIT=FALSE";
+
+		configuration.addDataSourceProperty("URL", "jdbc:h2:" + url + h2Settings);
 		configuration.addDataSourceProperty("user", sectionNode.get("user", ""));
 		configuration.addDataSourceProperty("password", sectionNode.get("password", ""));
 		configuration.addDataSourceProperty("description", sectionNode.get("description", ""));
@@ -95,6 +103,33 @@ public class H2Storage extends JdbcStorage {
 	@Override
 	protected PreparedStatement deleteListQuery(Connection connection) throws SQLException {
 		return connection.prepareStatement("DELETE FROM " + table + " WHERE `name` LIKE ?");
+	}
+
+	@Override
+	protected void afterSave(Connection conn) throws SQLException {
+		try (Statement stmt = conn.createStatement()) {
+			stmt.execute("CHECKPOINT");
+		}
+	}
+
+	@Override
+	protected void closeDatabase() throws SQLException {
+		if (database != null) {
+			try (Connection conn = database.getConnection();
+				 Statement stmt = conn.createStatement()) {
+				stmt.execute("SHUTDOWN");
+			} catch (SQLException exception) {
+				// 90121: Database is already closed
+				// This happens because we just executed SHUTDOWN, so the DB just closed
+				// and try with resources tries to close the connection again
+				// We can safely ignore this.
+				if (exception.getErrorCode() != 90121) {
+					throw exception;
+				}
+			}
+			if (!database.isClosed())
+				database.close();
+		}
 	}
 
 }

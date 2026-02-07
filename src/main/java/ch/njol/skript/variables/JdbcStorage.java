@@ -545,6 +545,9 @@ public abstract class JdbcStorage extends VariableStorage {
 		VariablesMap snapshotCleared;
 
 		// swap; this essentially clears the uncommited change maps
+		// TODO critical, this can cause data lost if the executor is shutdown on close
+		//  as the final save will have empty maps but not everything finished saving.
+		//  There must be a recover if the peformSave fails
 		long stamp = lock.writeLock();
 		try {
 			snapshotDirty = dirty;
@@ -562,6 +565,8 @@ public abstract class JdbcStorage extends VariableStorage {
 
 		try (Connection conn = database.getConnection()) {
 			conn.setAutoCommit(false);
+
+			beforeSave(conn);
 
 			// process deletions
 			if (!snapshotCleared.isEmpty()) {
@@ -623,13 +628,35 @@ public abstract class JdbcStorage extends VariableStorage {
 			}
 
 			conn.commit();
+			afterSave(conn);
 		} catch (SQLException exception) {
 			Skript.error("Failed to save variables to database: " + exception.getLocalizedMessage());
 		}
 	}
 
+	/**
+	 * Runs before the variable changes save.
+	 * <p>
+	 * This is already a part of the transaction that saves the variable values
+	 * into the database.
+	 *
+	 * @param conn connection
+	 */
+	protected void beforeSave(Connection conn) throws SQLException {
+	}
+
+	/**
+	 * Runs after the variables are saved into memory.
+	 * <p>
+	 * This is after the transaction for the variable save has been committed.
+	 *
+	 * @param conn connection
+	 */
+	protected void afterSave(Connection conn) throws SQLException {
+	}
+
 	@Override
-	public void close() {
+	public final void close() {
 		if (!closed.compareAndSet(false, true))
 			return;
 		if (saveTask != null) {
@@ -639,19 +666,41 @@ public abstract class JdbcStorage extends VariableStorage {
 		// it can not finish the save anyway because Skript is disabled and
 		// serialization will fail off main thread as it can not schedule
 		// tasks to serialize such variables
-		saveExecutor.shutdownNow();
+		// we shutdown safely to avoid data corruption
+		saveExecutor.shutdown();
 
-		// wait for the background thread to actually release the file
 		try {
 			if (!saveExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
 				Skript.warning("Variable save thread took too long to shutdown. Final save might fail.");
+				saveExecutor.shutdownNow();
+				if (!saveExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+					Skript.error("Variable save thread failed to shut down!");
+				}
 			}
 		} catch (InterruptedException e) {
 			Thread.currentThread().interrupt();
+			saveExecutor.shutdownNow();
 		}
 
 		if (database != null) {
+			Skript.info("Performing final variable save for '" + getUserConfigurationName() + "'");
 			performSave();
+			Skript.info("Closing the database '" + getUserConfigurationName() + "'");
+			try {
+				closeDatabase();
+			} catch (SQLException exception) {
+				Skript.exception(exception, "Failed to close the database '" + getUserConfigurationName() + "'");
+			}
+		}
+	}
+
+	/**
+	 * Called when closing the database after Skript shutdown.
+	 * <p>
+	 * This method must close the database source.
+	 */
+	protected void closeDatabase() throws SQLException {
+		if (database != null && !database.isClosed()) {
 			database.close();
 		}
 	}

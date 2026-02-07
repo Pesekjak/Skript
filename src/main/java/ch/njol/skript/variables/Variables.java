@@ -387,7 +387,7 @@ public final class Variables {
 		if (!all.isEmpty()) {
 			VariableStorage first = all.getFirst();
 			Skript.warning("Found multiple databases for variable '" + name + "'. Resolve the database pattern " +
-				"conflicts in the config. Saving to '" + first.getDatabaseType() + "' database");
+				"conflicts in the config. Saving to '" + first.getUserConfigurationName() + "' database");
 			return first;
 		}
 		return defaultStorage;
