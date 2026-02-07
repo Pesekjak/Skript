@@ -16,8 +16,8 @@ import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.locks.StampedLock;
 import java.util.function.BiConsumer;
-import java.util.function.Consumer;
 import java.util.function.Function;
+import java.util.function.UnaryOperator;
 
 /**
  * A thread-safe Radix Tree for storing variables.
@@ -145,30 +145,21 @@ public final class VariablesMap {
 	private static class Node extends AbstractMap<String, Object> {
 
 		/**
-		 * Reentrant lock that is locked when entering to the node
-		 * and released when exiting from the node.
+		 * Lock that is read locked when entering to the node
+		 * and released when the operation that locked it, is complete.
 		 * <p>
-		 * During the traversal, the thread always holds at least one lock,
-		 * that means before releasing the lock of the previous node,
-		 * the lock of the next one is acquired (hand-over-hand locking)
-		 * to ensure safe traversal.
-		 * <p>
-		 * Write lock is acquired only when updating either the value
-		 * of the node or modifying the children map (when child is missing
-		 * during the set operation).
+		 * Write lock is acquired only when clearing an entire subtree
+		 * of a node to ensure all operations on that subtree are
+		 * completed before it is cleared or when calling {@link #prune()}
+		 * which needs to lock the entire tree.
 		 */
 		final StampedLock lock = new StampedLock();
 
 		/**
-		 * Value assigned to this variables map node.
-		 * <p>
-		 * It is marked as volatile to ensure that the node does
-		 * always access the current version of its value when
-		 * acting as a live view of the tree branch.
-		 * <p>
-		 * {@code null} if the variable is not set
+		 * Current value assigned to this variable or {@code null} if
+		 * no value is set.
 		 */
-		volatile @Nullable Object value;
+		final AtomicReference<@Nullable Object> ref = new AtomicReference<>();
 
 		/**
 		 * Children of this node.
@@ -176,10 +167,11 @@ public final class VariablesMap {
 		 * This uses {@link ConcurrentSkipListMap} because:
 		 * <br>
 		 * <li>The iterator used by the live-view of this node must be thread safe</li>
+		 * <li>The map itself must be thread safe as it is modified under read lock of the node</li>
 		 * <li>The children need to be sorted by the variables name compare</li>
 		 * </br>
 		 * This allows us to use the live view of this map as a view of this node
-		 * (if correctly lazily transformed).
+		 * (if transformed to match the map format of {@link #getVariable(String)}).
 		 */
 		final Map<String, Node> children = new ConcurrentSkipListMap<>(VARIABLE_NAME_COMP);
 
@@ -195,13 +187,13 @@ public final class VariablesMap {
 		 */
 		@Override
 		public boolean isEmpty() {
-			return value == null && !hasChildren();
+			return ref.get() == null && !hasChildren();
 		}
 
 		@Override
 		public int size() {
 			int size = children.size();
-			return value != null ? ++size : size; // include the value if present as it is mapped to null key
+			return ref.get() != null ? ++size : size; // include the value if present as it is mapped to null key
 		}
 
 		@Override
@@ -212,7 +204,7 @@ public final class VariablesMap {
 		@Override
 		public Object get(Object key) {
 			if (key == null)
-				return value;
+				return ref.get();
 			Node child = children.get(key);
 			return child != null ? child.unwrap() : null;
 		}
@@ -223,7 +215,7 @@ public final class VariablesMap {
 				@Override
 				@SuppressWarnings({"rawtypes", "unchecked"})
 				public @NotNull Iterator iterator() {
-					Object value = Node.this.value;
+					Object value = Node.this.ref.get();
 
 					Iterator<Entry<String, Node>> wrapped = children.entrySet().iterator();
 					Iterator<Entry<String, Object>> iterator;
@@ -260,22 +252,7 @@ public final class VariablesMap {
 		 * @return returns the representation of this node in the exposed map
 		 */
 		private Object unwrap() {
-			return hasChildren() ? this : value;
-		}
-
-		/**
-		 * Unlocks the lock with given stamp.
-		 * <p>
-		 * Works for both read and write locks.
-		 *
-		 * @param stamp lock stamp
-		 */
-		void unlock(long stamp) {
-			if (StampedLock.isWriteLockStamp(stamp)) {
-				lock.unlockWrite(stamp);
-			} else {
-				lock.unlockRead(stamp);
-			}
+			return hasChildren() ? this : ref.get();
 		}
 
 	}
@@ -365,8 +342,15 @@ public final class VariablesMap {
 			name = name.substring(0, name.length() - (Variable.SEPARATOR.length() + 1)); // strip the "::*" suffix
 
 		String[] parts = Variables.splitVariableName(name);
+
+		int limit = parts.length + 1; // +1 for the root node
+		Node[] path = new Node[limit];
+		long[] stamps = new long[limit];
+		int depth = 0;
+
 		Node current = root;
-		long stamp = current.lock.readLock();
+		path[0] = current;
+		stamps[0] = current.lock.readLock();
 
 		try {
 			for (String part : parts) {
@@ -377,19 +361,24 @@ public final class VariablesMap {
 					return null;
 
 				long nextStamp = next.lock.readLock();
-				current.lock.unlockRead(stamp);
+
+				depth++;
+				path[depth] = next;
+				stamps[depth] = nextStamp;
 
 				current = next;
-				stamp = nextStamp;
 			}
 
 			if (isList) {
 				return current;
 			} else {
-				return current.value;
+				return current.ref.get();
 			}
 		} finally {
-			current.lock.unlockRead(stamp);
+			for (int i = depth; i >= 0; i--) {
+				if (path[i] != null)
+					path[i].lock.unlockRead(stamps[i]);
+			}
 		}
 	}
 
@@ -417,10 +406,11 @@ public final class VariablesMap {
 
 		String[] parts = Variables.splitVariableName(actualName);
 
-		if (value == null) {
-			return clearVariable(root, parts, isList);
+		if (isList) { // we are clearing a list
+			clearListVariable(root, parts);
+			return null;
 		} else {
-			return modifySingleVariable(root, parts, node -> node.value = value);
+			return modifySingleVariable(root, parts, old -> value /* discard previous, set to new */);
 		}
 	}
 
@@ -442,10 +432,14 @@ public final class VariablesMap {
 		Preconditions.checkState(!name.endsWith(Variable.SEPARATOR + "*"));
 		AtomicReference<Object> got = new AtomicReference<>();
 		String[] parts = Variables.splitVariableName(name);
-		modifySingleVariable(root, parts, node -> {
-			if (node.value == null)
-				node.value = mappingFunction.apply(name);
-			got.set(node.value);
+		modifySingleVariable(root, parts, prev -> {
+			if (prev == null) {
+				Object computed = mappingFunction.apply(name);
+				got.set(computed);
+				return computed;
+			}
+			got.set(prev);
+			return prev;
 		});
 		return got.get();
 	}
@@ -458,114 +452,96 @@ public final class VariablesMap {
 	 * @param operation operation to apply
 	 * @return value associated with the node before the operation
 	 */
-	private @Nullable Object modifySingleVariable(Node root, String[] parts, Consumer<Node> operation) {
+	private @Nullable Object modifySingleVariable(Node root, String[] parts, UnaryOperator<Object> operation) {
+		int limit = parts.length + 1; // +1 for the root node
+		Node[] path = new Node[limit];
+		long[] stamps = new long[limit];
+		int depth = 0;
+
 		Node current = root;
-		long stamp = current.lock.readLock();
+		path[0] = current;
+		stamps[0] = current.lock.readLock();
+
 		try {
-			for (int i = 0; i < parts.length; i++) {
-				String key = parts[i];
-				boolean isLast = i == parts.length - 1;
+			for (String part : parts) {
+				// this can be done under read lock because the children map implementation
+				// itself is thread safe
+				Node next = current.children.computeIfAbsent(part, key -> new Node());
 
-				// we need write lock if the child does not exist (to create the node in the map)
-				boolean childExists = current.children.containsKey(key);
+				long nextStamp = next.lock.readLock();
 
-				if (!childExists) {
-					// try to upgrade
-					long ws = current.lock.tryConvertToWriteLock(stamp);
-					if (ws == 0L) {
-						// if failed, reverse and wait for write lock
-						current.lock.unlockRead(stamp);
-						stamp = current.lock.writeLock();
-					} else {
-						stamp = ws;
-					}
-					// could already be added during the waiting on the write lock
-					current.children.putIfAbsent(key, new Node());
-				}
-
-				Node next = current.children.get(key);
-				// for last node we write the value
-				long nextStamp = isLast ? next.lock.writeLock() : next.lock.readLock();
-
-				current.unlock(stamp);
+				depth++;
+				path[depth] = next;
+				stamps[depth] = nextStamp;
 
 				current = next;
-				stamp = nextStamp;
-
-				if (isLast) {
-					Object previous = current.value;
-					operation.accept(current);
-					return previous;
-				}
 			}
+
+			Object prev = current.ref.getAndUpdate(operation);
+			checkForPrune(current);
+			return prev;
 		} finally {
-			// unlock the final node
-			current.unlock(stamp);
+			for (int i = depth; i >= 0; i--) {
+				if (path[i] != null)
+					path[i].lock.unlock(stamps[i]);
+			}
 		}
-		return null;
 	}
 
 	/**
-	 * Iterative setter for clearing values.
+	 * Clears a list variable.
+	 * <p>
+	 * Compare to other operations, this one functions a lot differently and
+	 * does not need to read lock the entire path.
+	 * <p>
+	 * This is the only operation that uses the write lock of the node it is clearing.
+	 * Reason for this is, all operations happening on this part of the sub-tree
+	 * also hold a read lock for this particular node, meaning it:
+	 * <ul>
+	 *     <li>Stops any other future operations from happening until the list clear completes</li>
+	 *     <li>Waits for all operations happening in the sub-tree to finish</li>
+	 * </ul>
+	 * This ensures no invalid values are returned (different thread could return already deleted
+	 * values otherwise).
 	 *
 	 * @param root root node
 	 * @param parts parts of the variable to clear
-	 * @param isListClear whether this is a list clear
-	 * @return cleared object if {@code isListClear} is false, else null
 	 */
-	private @Nullable Object clearVariable(Node root, String[] parts, boolean isListClear) {
+	private void clearListVariable(Node root, String[] parts) {
 		Node current = root;
-		long stamp = current.lock.readLock();
-		boolean prune = false;
-		try {
-			for (int i = 0; i < parts.length; i++) {
-				String key = parts[i];
-				boolean isLast = i == parts.length - 1;
-
-				// if child does not exist there is nothing to clear
-				if (!current.children.containsKey(key))
-					return null; // unlocks in the finally block
-
-				Node next = current.children.get(key);
-				// for last node we write the value
-				long nextStamp = isLast ? next.lock.writeLock() : next.lock.readLock();
-
-				current.unlock(stamp);
-
-				current = next;
-				stamp = nextStamp;
-
-				if (isLast) {
-					Object previous;
-
-					if (isListClear) {
-						previous = null;
-						// TODO before this returns, it should block until there are no reads happening
-						//  in the subtrees, try implement this with Phaser (parenting Phasers may be useful)
-						current.children.clear();
-					} else {
-						previous = current.value;
-						current.value = null;
-					}
-
-					// clear may caused empty branches in the tree
-					if (current.isEmpty()) {
-						int count = leftEmpty.incrementAndGet();
-						// automatic prune call
-						if (count >= pruneAt) {
-							if (leftEmpty.compareAndSet(count, 0))
-								prune = true;
-						}
-					}
-					return previous;
-				}
-			}
-		} finally {
-			current.unlock(stamp);
-			if (prune)
-				pruneExecutor.execute(this::prune);
+		for (String key : parts) {
+			Node next = current.children.get(key);
+			// if child does not exist there is nothing to clear
+			if (next == null)
+				return;
+			current = next;
 		}
-		return null;
+		long stamp = current.lock.writeLock();
+		try {
+			current.children.clear();
+		} finally {
+			current.lock.unlockWrite(stamp);
+			checkForPrune(current);
+		}
+	}
+
+	/**
+	 * Checks if the node if empty, if yes, it increases the
+	 * empty nodes counter and possibly triggers automatic {@link #prune()} call
+	 * if the number of empty nodes exceeds {@link #pruneAt}.
+	 * <p>
+	 * This does not have to be fully accurate and atomic with the clear operations
+	 * themselves, as {@link #leftEmpty} is only an estimate.
+	 *
+	 * @param node node to check after appplying an operation
+	 */
+	private void checkForPrune(Node node) {
+		if (!node.isEmpty())
+			return;
+		int count = leftEmpty.incrementAndGet();
+		if (count >= pruneAt && leftEmpty.compareAndSet(count, 0)) {
+			pruneExecutor.execute(this::prune);
+		}
 	}
 
 	/**
@@ -599,9 +575,6 @@ public final class VariablesMap {
 
 	/**
 	 * Creates a copy of this map.
-	 * <p>
-	 * This method returns a copy of a snapshot of the variables map at
-	 * the current moment.
 	 *
 	 * @return the copy.
 	 */
@@ -614,7 +587,7 @@ public final class VariablesMap {
 	private void copy(Node source, Node target) {
 		long stamp = source.lock.readLock();
 		try {
-			target.value = source.value;
+			target.ref.set(source.ref.get());
 			if (source.hasChildren()) {
 				source.children.forEach((key, sourceChild) -> {
 					Node targetChild = new Node();
@@ -637,10 +610,7 @@ public final class VariablesMap {
 	/**
 	 * Returns all variables in this map.
 	 * <p>
-	 * The map is no guaranteed order and may not be modifiable.
-	 * <p>
-	 * This method returns a full snapshot of the variables map at
-	 * the current moment.
+	 * The map is unmodifiable and ordered in the variables name order.
 	 * <p>
 	 * This map is not nested and contains variables in format {@code full key <-> value}
 	 *
@@ -655,8 +625,8 @@ public final class VariablesMap {
 	private void getAll(String buffer, Node source, BiConsumer<String, Object> collector) {
 		long stamp = source.lock.readLock();
 		try {
-			if (source.value != null)
-				collector.accept(buffer, source.value);
+			if (source.ref.get() != null)
+				collector.accept(buffer, source.ref.get());
 			if (source.hasChildren()) {
 				source.children.forEach((key, child) -> {
 					String nextName = buffer.isEmpty() ? key : buffer + Variable.SEPARATOR + key;
@@ -670,9 +640,6 @@ public final class VariablesMap {
 
 	/**
 	 * Returns number of variables in this map.
-	 * <p>
-	 * This method returns number of variables at
-	 * the current moment.
 	 *
 	 * @return number of variables in this map
 	 */
@@ -684,7 +651,7 @@ public final class VariablesMap {
 		long stamp = node.lock.readLock();
 		long size = 0;
 		try {
-			if (node.value != null)
+			if (node.ref.get() != null)
 				size++;
 			if (node.hasChildren()) {
 				for (Node child : node.children.values())
