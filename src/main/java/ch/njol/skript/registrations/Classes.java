@@ -49,8 +49,8 @@ public abstract class Classes {
 
 	private Classes() {}
 
-	@Nullable
-	private static ClassInfo<?>[] classInfos = null;
+	private static ClassInfo<?> @Nullable [] classInfos = null;
+	private static @Nullable List<ClassInfo<?>> classInfosView = null;
 	private final static List<ClassInfo<?>> tempClassInfos = new ArrayList<>();
 	private final static HashMap<Class<?>, ClassInfo<?>> exactClassInfos = new HashMap<>();
 	private final static HashMap<Class<?>, ClassInfo<?>> superClassInfos = new HashMap<>();
@@ -185,7 +185,8 @@ public abstract class Classes {
 			}
 		}
 
-		Classes.classInfos = classInfos.toArray(new ClassInfo[classInfos.size()]);
+		Classes.classInfos = classInfos.toArray(new ClassInfo[0]);
+		Classes.classInfosView = List.of(Classes.classInfos);
 
 		// check for circular dependencies
 		if (!tempClassInfos.isEmpty()) {
@@ -241,10 +242,10 @@ public abstract class Classes {
 	@SuppressWarnings("null")
 	public static List<ClassInfo<?>> getClassInfos() {
 		checkAllowClassInfoInteraction();
-		final ClassInfo<?>[] ci = classInfos;
-		if (ci == null)
+		final List<ClassInfo<?>> view = classInfosView;
+		if (view == null)
 			return Collections.emptyList();
-		return Collections.unmodifiableList(Arrays.asList(ci));
+		return view;
 	}
 
 	/**

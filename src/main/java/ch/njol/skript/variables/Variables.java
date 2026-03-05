@@ -12,7 +12,8 @@ import ch.njol.skript.lang.KeyedValue;
 import ch.njol.skript.lang.Variable;
 import ch.njol.skript.log.SkriptLogger;
 import ch.njol.skript.registrations.Classes;
-import ch.njol.util.*;
+import ch.njol.util.Kleenean;
+import ch.njol.util.StringUtils;
 import ch.njol.util.coll.iterator.EmptyIterator;
 import ch.njol.yggdrasil.ClassResolver;
 import ch.njol.yggdrasil.Yggdrasil;
@@ -29,17 +30,15 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.UnmodifiableView;
 import org.jetbrains.annotations.VisibleForTesting;
 import org.skriptlang.skript.addon.SkriptAddon;
-
-import java.util.*;
-import java.util.concurrent.*;
-import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.function.BiFunction;
-import java.util.regex.Pattern;
-
 import org.skriptlang.skript.variables.storage.H2Storage;
 import org.skriptlang.skript.variables.storage.InMemoryVariableStorage;
 import org.skriptlang.skript.variables.storage.MySQLStorage;
 import org.skriptlang.skript.variables.storage.SQLiteStorage;
+
+import java.util.*;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.function.BiFunction;
 
 /**
  * Factory class that handles things related to variables.
@@ -267,11 +266,6 @@ public final class Variables {
 	}
 
 	/**
-	 * A pattern to split variable names using {@link Variable#SEPARATOR}.
-	 */
-	private static final Pattern VARIABLE_NAME_SPLIT_PATTERN = Pattern.compile(Pattern.quote(Variable.SEPARATOR));
-
-	/**
 	 * Splits the given variable name into its parts,
 	 * separated by {@link Variable#SEPARATOR}.
 	 *
@@ -279,7 +273,29 @@ public final class Variables {
 	 * @return the parts.
 	 */
 	public static String[] splitVariableName(String name) {
-		return VARIABLE_NAME_SPLIT_PATTERN.split(name);
+		String sep = Variable.SEPARATOR;
+		int sepLen = sep.length();
+		// Fast path for 0 or 1 separators
+		int first = name.indexOf(sep);
+		if (first == -1)
+			return new String[]{name};
+
+		int second = name.indexOf(sep, first + sepLen);
+		if (second == -1)
+			return new String[]{name.substring(0, first), name.substring(first + sepLen)};
+
+		// use a list for higher counts
+		List<String> parts = new ArrayList<>();
+		parts.add(name.substring(0, first));
+		parts.add(name.substring(first + sepLen, second));
+		int start = second + sepLen;
+		int index;
+		while ((index = name.indexOf(sep, start)) != -1) {
+			parts.add(name.substring(start, index));
+			start = index + sepLen;
+		}
+		parts.add(name.substring(start));
+		return parts.toArray(String[]::new);
 	}
 
 	/**

@@ -10,7 +10,7 @@ import org.jetbrains.annotations.Nullable;
 import org.jetbrains.annotations.Unmodifiable;
 
 import java.util.*;
-import java.util.concurrent.ConcurrentSkipListMap;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
@@ -25,6 +25,8 @@ import java.util.function.UnaryOperator;
 @ThreadSafe
 public final class VariablesMap {
 
+	public static int comparisons = 0;
+
 	/**
 	 * Comparator for variable names.
 	 */
@@ -33,6 +35,36 @@ public final class VariablesMap {
 			return s2 == null ? 0 : -1;
 		if (s2 == null)
 			return 1;
+		int len1 = s1.length();
+		int len2 = s2.length();
+
+		comparisons++;
+
+		// Fast path: assume both strings are pure positive integers without leading zeros.
+		// This is the dominant case for list indices (e.g. {list::1} through {list::1000}).
+		// For these, numeric order == length order, then lexicographic order.
+		// This does cause an extra partial loop over non-integer strings, but ints are much more common and it'll fail-fast.
+		char firstChar1 = len1 > 0 ? s1.charAt(0) : 0;
+		char firstChar2 = len2 > 0 ? s2.charAt(0) : 0;
+		if (firstChar1 >= '1' && firstChar1 <= '9' && firstChar2 >= '1' && firstChar2 <= '9') {
+			int i = 1;
+			// Check if the rest of the characters are digits as well
+			while (i < len1 && isDigit(s1.charAt(i))) {
+				i++;
+			}
+			if (i == len1) { // all of s1 are digits
+				i = 1;
+				// Check if the rest of the characters are digits as well
+				while (i < len2 && isDigit(s2.charAt(i))) {
+					i++;
+				}
+				if (i == len2) { // all of s2 are digits
+					if (len1 != len2)
+						return len1 - len2;
+					return s1.compareTo(s2);
+				}
+			}
+		}
 
 		int i = 0;
 		int j = 0;
@@ -45,7 +77,7 @@ public final class VariablesMap {
 			char c2 = s2.charAt(j);
 
 			// Numbers/digits are treated differently from other characters.
-			if (Character.isDigit(c1) && Character.isDigit(c2)) {
+			if (isDigit(c1) && isDigit(c2)) {
 
 				// The index after the last digit
 				int end1 = StringUtils.findLastDigit(s1, i);
@@ -131,6 +163,10 @@ public final class VariablesMap {
 		return 0;
 	};
 
+	private static boolean isDigit(char c) {
+		return c >= '0' && c <= '9';
+	}
+
 	/**
 	 * A node in the radix tree.
 	 * <p>
@@ -164,16 +200,35 @@ public final class VariablesMap {
 		/**
 		 * Children of this node.
 		 * <p>
-		 * This uses {@link ConcurrentSkipListMap} because:
-		 * <br>
-		 * <li>The iterator used by the live-view of this node must be thread safe</li>
-		 * <li>The map itself must be thread safe as it is modified under read lock of the node</li>
-		 * <li>The children need to be sorted by the variables name compare</li>
-		 * </br>
-		 * This allows us to use the live view of this map as a view of this node
-		 * (if transformed to match the map format of {@link #getVariable(String)}).
+		 * Uses {@link ConcurrentHashMap} for O(1) insertion and lookup.
+		 * Sorted order is maintained lazily via {@link #sortedChildrenCache}
+		 * and only materialised when {@link #entrySet()} is iterated.
 		 */
-		final Map<String, Node> children = new ConcurrentSkipListMap<>(VARIABLE_NAME_COMP);
+		final Map<String, Node> children = new ConcurrentHashMap<>();
+
+		/**
+		 * Cached sorted snapshot of {@link #children}'s entry set.
+		 * {@code null} means the cache is invalid and must be recomputed on next read.
+		 * <p>
+		 * Two threads may compute the same sorted list simultaneously (benign race);
+		 * both results are correct and one silently wins, matching the weakly-consistent
+		 * semantics of the previous {@code ConcurrentSkipListMap} iterator.
+		 */
+		private volatile @Nullable ArrayList<Map.Entry<String, Node>> sortedChildrenCache = null;
+
+		void invalidateSortCache() {
+			sortedChildrenCache = null;
+		}
+
+		private ArrayList<Map.Entry<String, Node>> sortedChildren() {
+			ArrayList<Map.Entry<String, Node>> cached = sortedChildrenCache;
+			if (cached != null)
+				return cached;
+			ArrayList<Map.Entry<String, Node>> sorted = new ArrayList<>(children.entrySet());
+			sorted.sort(Map.Entry.comparingByKey(VARIABLE_NAME_COMP));
+			sortedChildrenCache = sorted; // benign race: both results are correct
+			return sorted;
+		}
 
 		/**
 		 * @return whether the node has children
@@ -217,7 +272,7 @@ public final class VariablesMap {
 				public @NotNull Iterator iterator() {
 					Object value = Node.this.ref.get();
 
-					Iterator<Entry<String, Node>> wrapped = children.entrySet().iterator();
+					Iterator<Entry<String, Node>> wrapped = sortedChildren().iterator();
 					Iterator<Entry<String, Object>> iterator;
 
 					if (value != null) {
@@ -466,7 +521,17 @@ public final class VariablesMap {
 			for (String part : parts) {
 				// this can be done under read lock because the children map implementation
 				// itself is thread safe
-				Node next = current.children.computeIfAbsent(part, key -> new Node());
+				Node next = current.children.get(part);
+				if (next == null) {
+					Node created = new Node();
+					Node raced = current.children.putIfAbsent(part, created);
+					if (raced == null) {
+						current.invalidateSortCache(); // new key added; sort order has changed
+						next = created;
+					} else {
+						next = raced; // another thread won the race
+					}
+				}
 
 				long nextStamp = next.lock.readLock();
 
@@ -519,6 +584,7 @@ public final class VariablesMap {
 		long stamp = current.lock.writeLock();
 		try {
 			current.children.clear();
+			current.invalidateSortCache();
 		} finally {
 			current.lock.unlockWrite(stamp);
 			checkForPrune(current);
@@ -560,12 +626,17 @@ public final class VariablesMap {
 				return true;
 
 			var it = node.children.entrySet().iterator();
+			boolean anyRemoved = false;
 			while (it.hasNext()) {
 				var entry = it.next();
 				boolean isChildEmpty = prune(entry.getValue());
-				if (isChildEmpty)
+				if (isChildEmpty) {
 					it.remove();
+					anyRemoved = true;
+				}
 			}
+			if (anyRemoved)
+				node.invalidateSortCache();
 
 			return node.isEmpty();
 		} finally {
