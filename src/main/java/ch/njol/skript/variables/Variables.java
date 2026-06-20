@@ -34,7 +34,6 @@ import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.BiFunction;
-import java.util.regex.Pattern;
 
 import org.skriptlang.skript.variables.storage.H2Storage;
 import org.skriptlang.skript.variables.storage.InMemoryVariableStorage;
@@ -267,11 +266,6 @@ public final class Variables {
 	}
 
 	/**
-	 * A pattern to split variable names using {@link Variable#SEPARATOR}.
-	 */
-	private static final Pattern VARIABLE_NAME_SPLIT_PATTERN = Pattern.compile(Pattern.quote(Variable.SEPARATOR));
-
-	/**
 	 * Splits the given variable name into its parts,
 	 * separated by {@link Variable#SEPARATOR}.
 	 *
@@ -279,7 +273,28 @@ public final class Variables {
 	 * @return the parts.
 	 */
 	public static String[] splitVariableName(String name) {
-		return VARIABLE_NAME_SPLIT_PATTERN.split(name);
+		String sep = Variable.SEPARATOR;
+		int sepLen = sep.length();
+		// Fast path for 0 or 1 separators — covers the vast majority of cases
+		// and avoids ArrayList allocation entirely.
+		int first = name.indexOf(sep);
+		if (first == -1)
+			return new String[]{name};
+		int second = name.indexOf(sep, first + sepLen);
+		if (second == -1)
+			return new String[]{name.substring(0, first), name.substring(first + sepLen)};
+		// 3+ parts — use a list for the remainder
+		List<String> parts = new ArrayList<>();
+		parts.add(name.substring(0, first));
+		parts.add(name.substring(first + sepLen, second));
+		int start = second + sepLen;
+		int index;
+		while ((index = name.indexOf(sep, start)) != -1) {
+			parts.add(name.substring(start, index));
+			start = index + sepLen;
+		}
+		parts.add(name.substring(start));
+		return parts.toArray(String[]::new);
 	}
 
 	/**

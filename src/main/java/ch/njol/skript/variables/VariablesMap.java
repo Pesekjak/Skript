@@ -28,87 +28,119 @@ public final class VariablesMap {
 	/**
 	 * Comparator for variable names.
 	 */
-	public static final Comparator<String> VARIABLE_NAME_COMP = (s1, s2) -> {
+	public static final Comparator<String> VARIABLE_NAME_COMPARATOR = (s1, s2) -> {
 		if (s1 == null)
 			return s2 == null ? 0 : -1;
+
 		if (s2 == null)
 			return 1;
+
+		int len1 = s1.length();
+		int len2 = s2.length();
+
+		// Fast path: assume both strings are pure positive integers without leading zeros.
+		// This is the dominant case for list indices (e.g. {list::1} through {list::1000}).
+		// For these, numeric order == length order, then lexicographic order.
+		// This does cause an extra partial loop over non-integer strings, but ints are much more common and it'll fail-fast.
+		char firstChar1 = len1 > 0 ? s1.charAt(0) : 0;
+		char firstChar2 = len2 > 0 ? s2.charAt(0) : 0;
+		if (firstChar1 >= '1' && firstChar1 <= '9' && firstChar2 >= '1' && firstChar2 <= '9') {
+			int i = 1;
+			// Check if the rest of the characters are digits as well
+			while (i < len1 && isDigit(s1.charAt(i))) {
+				i++;
+			}
+			if (i == len1) { // all of s1 are digits
+				i = 1;
+				// Check if the rest of the characters are digits as well
+				while (i < len2 && isDigit(s2.charAt(i))) {
+					i++;
+				}
+				if (i == len2) { // all of s2 are digits
+					if (len1 != len2)
+						return len1 - len2;
+					return s1.compareTo(s2);
+				}
+			}
+		}
 
 		int i = 0;
 		int j = 0;
 
 		boolean lastNumberNegative = false;
 		boolean afterDecimalPoint = false;
-
-		while (i < s1.length() && j < s2.length()) {
+		while (i < len1 && j < len2) {
 			char c1 = s1.charAt(i);
 			char c2 = s2.charAt(j);
 
-			// Numbers/digits are treated differently from other characters.
-			if (Character.isDigit(c1) && Character.isDigit(c2)) {
+			if (isDigit(c1) && isDigit(c2)) {
+				// Numbers/digits are treated differently from other characters.
 
 				// The index after the last digit
-				int end1 = StringUtils.findLastDigit(s1, i);
-				int end2 = StringUtils.findLastDigit(s2, j);
+				int i2 = StringUtils.findLastDigit(s1, i);
+				int j2 = StringUtils.findLastDigit(s2, j);
 
 				// Amount of leading zeroes
-				int leadingZeros1 = 0;
-				int leadingZeros2 = 0;
+				int z1 = 0;
+				int z2 = 0;
 
+				// Skip leading zeroes (except for the last if all 0's)
 				if (!afterDecimalPoint) {
-					while (i < end1 - 1 && s1.charAt(i) == '0') {
-						i++;
-						leadingZeros1++;
+					if (c1 == '0') {
+						while (i < i2 - 1 && s1.charAt(i) == '0') {
+							i++;
+							z1++;
+						}
 					}
-					while (j < end2 - 1 && s2.charAt(j) == '0') {
-						j++;
-						leadingZeros2++;
+					if (c2 == '0') {
+						while (j < j2 - 1 && s2.charAt(j) == '0') {
+							j++;
+							z2++;
+						}
 					}
 				}
+				// Keep in mind that c1 and c2 may not have the right value (e.g. s1.charAt(i)) for the rest of this block
 
 				// If the number is prefixed by a '-', it should be treated as negative, thus inverting the order.
 				// If the previous number was negative, and the only thing separating them was a '.',
 				//  then this number should also be in inverted order.
-				int startOfNumber = i - leadingZeros1;
-				boolean currentIsNegative = startOfNumber > 0 && s1.charAt(startOfNumber - 1) == '-';
+				boolean previousNegative = lastNumberNegative;
 
-				// if the previous number was negative and we just crossed a dot, we stay negative
-				boolean effectiveNegative = currentIsNegative || lastNumberNegative;
-				int sign = effectiveNegative ? -1 : 1;
-
-				int length1 = end1 - i;
-				int length2 = end2 - j;
+				// i - z1 contains the first digit, so i - z1 - 1 may contain a `-` indicating this number is negative
+				lastNumberNegative = i - z1 > 0 && s1.charAt(i - z1 - 1) == '-';
+				int isPositive = (lastNumberNegative | previousNegative) ? -1 : 1;
 
 				// Different length numbers (99 > 9)
-				if (!afterDecimalPoint && length1 != length2)
-					return (length1 - length2) * sign;
+				if (!afterDecimalPoint && i2 - i != j2 - j)
+					return ((i2 - i) - (j2 - j)) * isPositive;
 
 				// Iterate over the digits
-				while (i < end1 && j < end2) {
-					int diff = s1.charAt(i) - s2.charAt(j);
-					if (diff != 0)
-						return diff * sign;
+				while (i < i2 && j < j2) {
+					char d1 = s1.charAt(i);
+					char d2 = s2.charAt(j);
+
+					// If the digits differ, return a value dependent on the sign
+					if (d1 != d2)
+						return (d1 - d2) * isPositive;
+
 					i++;
 					j++;
 				}
 
 				// Different length numbers (1.99 > 1.9)
-				if (afterDecimalPoint && length1 != length2)
-					return (length1 - length2) * sign;
+				if (afterDecimalPoint && i2 - i != j2 - j)
+					return ((i2 - i) - (j2 - j)) * isPositive;
 
 				// If the numbers are equal, but either has leading zeroes,
-				//  more leading zeroes is a lesser number (01 < 1)
-				if (leadingZeros1 != leadingZeros2)
-					return (leadingZeros1 - leadingZeros2) * sign;
+				//  more leading zeroes is a bigger number (01 > 1)
+				// The original intention was for them to be smaller, but the author wrote it wrong so they're bigger :/
+				// Best to just keep it like that than to change it and break existing variable orderings
+				if (z1 != z2)
+					return (z1 - z2) * isPositive;
 
-				// We finished processing a number, we are now "after" a number.
-				// If the next char is a dot, we remain in decimal mode.
 				afterDecimalPoint = true;
-				// this is for backwards compatibility, else it should be effectiveNegative
-				lastNumberNegative = currentIsNegative;
-			}
-			// Normal characters
-			else {
+			} else {
+				// Normal characters
 				if (c1 != c2)
 					return c1 - c2;
 
@@ -122,14 +154,16 @@ public final class VariablesMap {
 				j++;
 			}
 		}
-
-		// One is prefix of the other
-		if (i < s1.length())
+		if (i < len1)
 			return lastNumberNegative ? -1 : 1;
-		if (j < s2.length())
+		if (j < len2)
 			return lastNumberNegative ? 1 : -1;
 		return 0;
 	};
+
+	private static boolean isDigit(char c) {
+		return '0' <= c && c <= '9';
+	}
 
 	/**
 	 * A node in the radix tree.
@@ -173,7 +207,7 @@ public final class VariablesMap {
 		 * This allows us to use the live view of this map as a view of this node
 		 * (if transformed to match the map format of {@link #getVariable(String)}).
 		 */
-		final Map<String, Node> children = new ConcurrentSkipListMap<>(VARIABLE_NAME_COMP);
+		final Map<String, Node> children = new ConcurrentSkipListMap<>(VARIABLE_NAME_COMPARATOR);
 
 		/**
 		 * @return whether the node has children
@@ -192,7 +226,9 @@ public final class VariablesMap {
 
 		@Override
 		public int size() {
-			int size = children.size();
+			int size = 0;
+			for (Node child : children.values())
+				if (!child.isEmpty()) size++;
 			return ref.get() != null ? ++size : size; // include the value if present as it is mapped to null key
 		}
 
@@ -232,6 +268,7 @@ public final class VariablesMap {
 
 					// this transformation is lazy
 					return Iterators.transform(iterator, entry -> {
+						assert entry != null;
 						if (entry.getKey() != null /* sub tree */) {
 							Node node = (Node) entry.getValue();
 							return new SimpleEntry<>(entry.getKey(), node.unwrap());
@@ -617,7 +654,7 @@ public final class VariablesMap {
 	 * @return all variables in this map
 	 */
 	public @Unmodifiable Map<String, Object> getAll() {
-		Map<String, Object> all = new TreeMap<>(VARIABLE_NAME_COMP);
+		Map<String, Object> all = new TreeMap<>(VARIABLE_NAME_COMPARATOR);
 		getAll("", root, all::put);
 		return Collections.unmodifiableMap(all);
 	}
