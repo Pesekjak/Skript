@@ -168,7 +168,7 @@ public final class VariablesMap {
 	/**
 	 * A node in the radix tree.
 	 * <p>
-	 * This also serves as a thread safe unmodifiable live view of the tree branch branch in
+	 * This also serves as a thread safe unmodifiable live view of the tree branch in
 	 * the format returned by {@link #getVariable(String)}.
 	 * <p>
 	 * It does not lock the tree and is weakly consistent, modifications to the underlying
@@ -217,19 +217,38 @@ public final class VariablesMap {
 		}
 
 		/**
-		 * @return whether the node is empty (has no value and no children)
+		 * @return if this node or any of its descendants contain a value
+		 */
+		boolean hasRealValues() {
+			if (ref.get() != null)
+				return true;
+			if (children.isEmpty())
+				return false;
+
+			for (Node child : children.values()) {
+				if (child.hasRealValues())
+					return true;
+			}
+			return false;
+		}
+
+		/**
+		 * @return whether the node is empty (has no real values)
+		 * @see #hasRealValues()
 		 */
 		@Override
 		public boolean isEmpty() {
-			return ref.get() == null && !hasChildren();
+			return !hasRealValues();
 		}
 
 		@Override
 		public int size() {
 			int size = 0;
-			for (Node child : children.values())
-				if (!child.isEmpty()) size++;
-			return ref.get() != null ? ++size : size; // include the value if present as it is mapped to null key
+			for (Node child : children.values()) {
+				if (child.hasRealValues())
+					size++;
+			}
+			return ref.get() != null ? size + 1 : size; // include the value if present as it is mapped to null key
 		}
 
 		@Override
@@ -242,7 +261,7 @@ public final class VariablesMap {
 			if (key == null)
 				return ref.get();
 			Node child = children.get(key);
-			return child != null ? child.unwrap() : null;
+			return (child != null && child.hasRealValues()) ? child.unwrap() : null;
 		}
 
 		@Override
@@ -253,7 +272,13 @@ public final class VariablesMap {
 				public @NotNull Iterator iterator() {
 					Object value = Node.this.ref.get();
 
-					Iterator<Entry<String, Node>> wrapped = children.entrySet().iterator();
+					Iterator<Entry<String, Node>> validChildren = Iterators.filter(
+						children.entrySet().iterator(),
+						entry -> {
+							assert entry != null;
+							return entry.getValue().hasRealValues();
+						}
+					);
 					Iterator<Entry<String, Object>> iterator;
 
 					if (value != null) {
@@ -261,9 +286,9 @@ public final class VariablesMap {
 						Iterator<Entry<String, Object>> itself =
 							(Iterator) Collections.singleton(new SimpleEntry<>(null, value)).iterator();
 						// source iterators are not polled until necessary, the null key is first
-						iterator = Iterators.concat(itself, (Iterator) wrapped);
+						iterator = Iterators.concat(itself, (Iterator) validChildren);
 					} else {
-						iterator = (Iterator) wrapped;
+						iterator = (Iterator) validChildren;
 					}
 
 					// this transformation is lazy
@@ -319,7 +344,7 @@ public final class VariablesMap {
 	/**
 	 * Constructs new variables map that automatically calls {@link #prune()}
 	 * after certain number of {@link #setVariable(String, Object)} left
-	 * empty branches in the radix tree.
+	 * empty leaf nodes in the radix tree.
 	 *
 	 * @param pruneAt after which number of such writes the variables map should call prune
 	 * @param pruneExecutor executor which will execute the expensive prune operation
@@ -350,22 +375,22 @@ public final class VariablesMap {
 	/**
 	 * Returns the value of the requested variable.
 	 * <p>
-	 * In case of list variables, the returned map is thread safe unmodifiable live view of the variables map.
+	 * In case of list variables, the returned map is thread safe unmodifiable weakly consistent view
+	 * of the variables map. Modifications to the underlying variables map by other threads may not be
+	 * immediately visible, prioritizing performance over strict in time snapshots.
+	 * There is no way to verify whether the node is still valid (part of the map).
 	 * <p>
 	 * If map is returned, it is sorted using the variables name comparator.
 	 * <p>
 	 * If map is returned the structure is as following:
 	 * <ul>
-	 *     <li>
-	 *         If value is present for the variable and
-	 *         <ul>
-	 *             <li>the variable has no children, its value is mapped directly to the key</li>
-	 *             <li>the variable has children, it is mapped to a map, that maps {@code null} to its value and its
-	 *             children are mapped using the same strategy</li>
-	 *         </ul>
-	 *     </li>
-	 *     <li>If value is not present for the variable, it is mapped to a map with its children mapped using the same
-	 *     strategy</li>
+	 * <li>Leaf variables (value only, no children): The key maps directly to the value of the variable</li>
+	 * <li>Branch variables (has children): The key maps to a {@code Map}. Inside this map:
+	 *   <ul>
+	 *   <li>Child variables are recursively mapped using these same strategy</li>
+	 *   <li>If the branch variable itself also has a value, that value is mapped to {@code null} key.</li>
+	 *   </ul>
+	 * </li>
 	 * </ul>
 	 *
 	 * @param name the name of the variable, possibly a list variable.
@@ -423,7 +448,7 @@ public final class VariablesMap {
 	 * Sets the given variable to the given value.
 	 * <p>
 	 * This method accepts list variables,
-	 * but these may only be set to {@code null}.
+	 * but these may only be set to {@code null} to clear the entire subtree.
 	 *
 	 * @param name the variable name.
 	 * @param value the variable value, {@code null} to delete the variable.
@@ -457,9 +482,11 @@ public final class VariablesMap {
 	 * <p>
 	 * This method only accepts single variables.
 	 * <p>
-	 * The {@code mappingFunction} is executed under a write lock on the variable's node.
 	 * Do not perform expensive operations or access other variables inside this function to avoid
 	 * deadlock and performance degradation.
+	 * <p>
+	 * The function should be side-effect-free, since it may be re-applied when attempted updates
+	 * fail due to contention among threads.
 	 *
 	 * @param name the variable name.
 	 * @param mappingFunction function providing the new value in case it is not set
@@ -573,10 +600,11 @@ public final class VariablesMap {
 	 * @param node node to check after appplying an operation
 	 */
 	private void checkForPrune(Node node) {
-		if (!node.isEmpty())
+		if (node.ref.get() != null || node.hasChildren())
 			return;
 		int count = leftEmpty.incrementAndGet();
-		if (count >= pruneAt && leftEmpty.compareAndSet(count, 0)) {
+		if (count == pruneAt) {
+			leftEmpty.set(0);
 			pruneExecutor.execute(this::prune);
 		}
 	}
